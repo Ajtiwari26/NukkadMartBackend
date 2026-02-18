@@ -1,0 +1,88 @@
+"""
+Application Configuration
+Manages environment variables and settings for all services
+"""
+from pydantic_settings import BaseSettings
+from pydantic import field_validator
+from functools import lru_cache
+from typing import Optional, List
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables"""
+
+    # Application
+    APP_NAME: str = "NukkadMart"
+    APP_VERSION: str = "1.0.0"
+    DEBUG: bool = True
+    API_V1_PREFIX: str = "/api/v1"
+
+    # MongoDB Configuration
+    MONGODB_URL: str = "mongodb://mongodb:27017"
+    MONGODB_DATABASE: str = "nukkadmart"
+
+    # Upstash Redis Configuration (Serverless)
+    UPSTASH_REDIS_REST_URL: str = "https://teaching-sunbeam-57733.upstash.io"
+    UPSTASH_REDIS_REST_TOKEN: str = ""
+    REDIS_CART_TTL: int = 1800  # 30 minutes TTL for cart state
+    REDIS_SESSION_TTL: int = 1800  # 30 minutes TTL for session
+    REDIS_ORDER_TTL: int = 86400  # 24 hours TTL for active orders
+
+    # Groq Configuration (Primary AI Service)
+    GROQ_API_KEY: Optional[str] = None
+    GROQ_VISION_MODEL: str = "meta-llama/llama-4-scout-17b-16e-instruct"
+    GROQ_TEXT_MODEL: str = "llama-3.3-70b-versatile"
+
+    # AWS Bedrock Configuration (for Amazon Nova - future use)
+    AWS_REGION: str = "ap-south-1"
+    AWS_ACCESS_KEY_ID: Optional[str] = None
+    AWS_SECRET_ACCESS_KEY: Optional[str] = None
+    BEDROCK_MODEL_ID: str = "amazon.nova-pro-v1:0"
+    BEDROCK_NOVA_ACT_MODEL_ID: str = "amazon.nova-act-v1:0"
+
+    # S3 Configuration
+    S3_BUCKET_NAME: str = "nukkadmart-images"
+    S3_REGION: str = "ap-south-1"
+
+    # Security
+    SECRET_KEY: str = "your-secret-key-change-in-production"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+
+    # CORS - comma-separated string that gets parsed to list
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
+
+    # Rate Limiting
+    RATE_LIMIT_REQUESTS: int = 100
+    RATE_LIMIT_WINDOW: int = 60  # seconds
+
+    # Nudge Engine
+    ABANDONMENT_THRESHOLD: float = 0.70  # 70% probability triggers nudge
+    MAX_DISCOUNT_PERCENT: float = 15.0
+    MIN_DISCOUNT_PERCENT: float = 5.0
+
+    # Razorpay Configuration
+    RAZORPAY_KEY_ID: Optional[str] = None
+    RAZORPAY_KEY_SECRET: Optional[str] = None
+    BYPASS_RAZORPAY: bool = False  # Set to True in development to skip actual payment
+
+    # Google Maps Configuration
+    GOOGLE_MAPS_API_KEY: Optional[str] = None
+
+    @property
+    def cors_origins_list(self) -> List[str]:
+        """Parse CORS_ORIGINS string to list"""
+        return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]
+
+    class Config:
+        env_file = ".env"
+        case_sensitive = True
+
+
+@lru_cache()
+def get_settings() -> Settings:
+    """Get cached settings instance"""
+    return Settings()
+
+
+settings = get_settings()
