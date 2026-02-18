@@ -24,7 +24,7 @@ groq==0.4.2            # Groq API client
 
 # Image Processing
 Pillow==10.2.0
-python-magic==0.4.27
+
 
 # Authentication & Security
 python-jose[cryptography]==3.3.0
