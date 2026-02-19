@@ -64,32 +64,51 @@ class AIService:
                 media_type = "image/jpeg"
 
             # Prepare the prompt for Groq Vision
-            prompt = """You are an OCR assistant specialized in reading product lists and price tags.
+            # Prepare the prompt for Groq Vision with strict JSON output
+            prompt = """You are an expert AI assistant for a grocery store. Your task is to extract product items from a handwritten shopping list image.
 
-Analyze this image and extract all products with their details.
+Analyze the image and extract every item listed. For each item, return a JSON object with the following fields:
 
-For each product, identify:
-1. Product name (full name including brand if visible)
-2. Quantity/Size (e.g., 500ml, 1kg, 200g)
-3. Price (in rupees)
+- `raw_text`: The exact text written for this item (e.g., "200 gm Sugar", "Colgate").
+- `search_term_english`: The English translation of the product name for searching (e.g., "Sugar", "Colgate Toothpaste"). If unreadable, set to null.
+- `req_qty`: The numeric quantity requested (e.g., 200, 1). If not specified, default to 1.
+- `req_unit`: The unit of measurement (e.g., "gm", "kg", "ml", "L", "piece"). If not specified, default to "piece".
+- `is_brand_specified`: Boolean, true if a specific brand is mentioned (e.g., "Amul", "Colgate").
+- `confidence_score`: A number between 0 and 1 indicating how confident you are in reading this item.
+- `is_unreadable`: Boolean, set to true if the text is illegible or confidence is low (< 0.5).
 
-Return your response in this exact format (plain text, one product per line):
-Product Name (quantity) - ₹price
+Return the result as a strictly valid JSON array of objects. Do not include any markdown formatting, code blocks, or explanations. Just the raw JSON array.
 
-Example:
-Full Cream Milk (500ml) - ₹33
-Toned Milk (500ml) - ₹27
-Amul Butter (100g) - ₹58
-
-Important:
-- Include the quantity in parentheses if visible
-- Use ₹ symbol before price
-- One product per line
-- If price is not visible, skip that product
-- Convert regional language names to English
-- Be precise with quantities (ml, L, g, kg)
-
-Return ONLY the product list, no other text or explanations."""
+Example Output:
+[
+  {
+    "raw_text": "200 gm शक्कर", 
+    "search_term_english": "Sugar",
+    "req_qty": 200,
+    "req_unit": "gm",
+    "is_brand_specified": false,
+    "confidence_score": 0.95,
+    "is_unreadable": false
+  },
+  {
+    "raw_text": "Colgate", 
+    "search_term_english": "Colgate Toothpaste",
+    "req_qty": 1,
+    "req_unit": "piece",
+    "is_brand_specified": true,
+    "confidence_score": 0.90,
+    "is_unreadable": false
+  },
+  {
+    "raw_text": "hgsdks", 
+    "search_term_english": null,
+    "req_qty": 1,
+    "req_unit": "piece",
+    "is_brand_specified": false,
+    "confidence_score": 0.1,
+    "is_unreadable": true
+  }
+]"""
 
             # Call Groq Vision API
             async with httpx.AsyncClient(timeout=60.0) as client:
@@ -112,7 +131,7 @@ Return ONLY the product list, no other text or explanations."""
                             ]
                         }
                     ],
-                    "max_tokens": 1024,
+                    "max_tokens": 2048,
                     "temperature": 0.1
                 }
                 
@@ -151,15 +170,40 @@ Return ONLY the product list, no other text or explanations."""
                 logger.info(f"Successfully extracted text: {content[:100]}...")
 
                 # Parse the text into structured items
-                items = self._parse_shopping_list_text(content)
-
-                # Return the extracted text and parsed items
-                return {
-                    "success": True,
-                    "raw_text": content.strip(),
-                    "items": items,
-                    "confidence": 0.85
-                }
+                try:
+                    # Clean up content if it contains markdown code blocks
+                    content = content.strip()
+                    if content.startswith("```json"):
+                        content = content[7:]
+                    if content.startswith("```"):
+                        content = content[3:]
+                    if content.endswith("```"):
+                        content = content[:-3]
+                    content = content.strip()
+                    
+                    items = json.loads(content)
+                    
+                    # Validate items structure
+                    validated_items = []
+                    for item in items:
+                        if isinstance(item, dict):
+                            validated_items.append(item)
+                            
+                    return {
+                        "success": True,
+                        "raw_text": json.dumps(validated_items, indent=2), # Store JSON representation as raw text for debugging
+                        "items": validated_items,
+                        "confidence": 0.95
+                    }
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse JSON response: {e}")
+                    # Fallback to empty list or better error handling
+                    return {
+                        "success": False,
+                        "raw_text": content,
+                        "error": "Failed to parse AI response",
+                        "items": []
+                    }
 
         except Exception as e:
             logger.error(f"Groq OCR error: {e}")
@@ -413,18 +457,39 @@ Return ONLY valid JSON, no other text."""
 
     def _mock_ocr_response(self) -> Dict[str, Any]:
         """Mock OCR response for development/testing"""
+        items = [
+            {
+                "raw_text": "2kg Rice",
+                "search_term_english": "Rice",
+                "req_qty": 2,
+                "req_unit": "kg",
+                "is_brand_specified": false,
+                "confidence_score": 0.95,
+                "is_unreadable": false
+            },
+            {
+                "raw_text": "100g Colgate",
+                "search_term_english": "Colgate Toothpaste",
+                "req_qty": 100,
+                "req_unit": "g",
+                "is_brand_specified": true,
+                "confidence_score": 0.90,
+                "is_unreadable": false
+            },
+            {
+                "raw_text": "scribble",
+                "search_term_english": null,
+                "req_qty": 1,
+                "req_unit": "piece",
+                "is_brand_specified": false,
+                "confidence_score": 0.1,
+                "is_unreadable": true
+            }
+        ]
         return {
-            "items": [
-                {"name": "Rice", "quantity": 2, "unit": "kg", "confidence": 0.95},
-                {"name": "Toor Dal", "quantity": 1, "unit": "kg", "confidence": 0.92},
-                {"name": "Sugar", "quantity": 500, "unit": "g", "confidence": 0.88},
-                {"name": "Milk", "quantity": 2, "unit": "L", "confidence": 0.91},
-                {"name": "Bread", "quantity": 1, "unit": "packet", "confidence": 0.85},
-                {"name": "Cooking Oil", "quantity": 1, "unit": "L", "confidence": 0.89},
-                {"name": "Salt", "quantity": 1, "unit": "kg", "confidence": 0.94},
-            ],
-            "raw_text": "2kg Rice\n1kg Dal\n500g Sugar\n2L Milk\n1 Bread\n1L Oil\n1kg Salt",
-            "language_detected": "Mixed (Hindi/English)",
+            "items": items,
+            "raw_text": json.dumps(items, indent=2),
+            "language_detected": "Mixed",
             "notes": "Mock response - AI service not configured",
             "is_mock": True
         }

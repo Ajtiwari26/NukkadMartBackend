@@ -239,7 +239,7 @@ class OCRService:
 
         # Match to store inventory
         inventory_service = InventoryService(self.db)
-        match_result = await inventory_service.match_products_from_ocr(
+        match_result = await inventory_service.match_smart_cart(
             store_id,
             items
         )

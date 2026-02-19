@@ -67,6 +67,8 @@ class MatchedCartItem(BaseModel):
     original_query: str
     matched_quantity: float
     line_total: float
+    status: str = "perfect"
+    modification_reason: Optional[str] = None
 
 
 class MatchedCartResponse(BaseModel):
@@ -75,7 +77,7 @@ class MatchedCartResponse(BaseModel):
     store_id: str
     ocr_items: List[dict]
     matched: List[MatchedCartItem]
-    unmatched: List[str]
+    unmatched: List[dict]
     suggestions: List[dict]
     cart_total: float
 

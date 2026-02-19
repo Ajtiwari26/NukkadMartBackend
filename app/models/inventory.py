@@ -262,12 +262,16 @@ class MatchedProduct(BaseModel):
     matched_quantity: float
     line_total: float
     thumbnail: Optional[str]
+    
+    # Smart Matching Fields
+    status: str = "perfect"  # "perfect", "size_modified", "brand_suggested"
+    modification_reason: Optional[str] = None
 
 
 class ProductMatchResponse(BaseModel):
     """Product matching response"""
     store_id: str
     matched: List[MatchedProduct]
-    unmatched: List[str]
+    unmatched: List[Dict]  # [{"raw_text": "...", "reason": "unreadable"}]
     suggestions: List[Dict]  # Alternative products for unmatched items
     cart_total: float
