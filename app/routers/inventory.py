@@ -8,6 +8,7 @@ from datetime import datetime
 
 from app.db.mongodb import get_database
 from app.services.inventory_service import InventoryService
+from app.core.cache import cache, TTL_INVENTORY_LIST, TTL_PRODUCT_INFO
 from app.models.product import (
     ProductCreate,
     ProductUpdate,

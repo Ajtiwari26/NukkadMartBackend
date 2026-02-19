@@ -12,6 +12,7 @@ import hashlib
 
 from app.db.mongodb import get_database
 from app.config import settings
+from app.core.cache import cache, TTL_NEARBY_STORES, TTL_STORE_INFO
 
 router = APIRouter(prefix="/stores", tags=["Stores"])
 
@@ -282,6 +283,20 @@ async def find_nearby_stores(
     limit: int = Query(20, ge=1, le=100)
 ):
     """Find stores near a location, sorted by distance."""
+    
+    # Round coordinates for cache key (2 decimal places = ~1km precision)
+    lat_r = round(lat, 2)
+    lng_r = round(lng, 2)
+    cache_key = f"nearby_stores:{lat_r}:{lng_r}:{radius_km}:{limit}"
+    
+    # Check cache
+    cached_data = cache.get(cache_key)
+    if cached_data:
+        print(f"✓ Cache hit: {cache_key}")
+        return cached_data
+    
+    print(f"✗ Cache miss: {cache_key}")
+    
     db = await get_database()
 
     # Get all active stores
@@ -321,8 +336,14 @@ async def find_nearby_stores(
 
     # Sort by distance
     nearby.sort(key=lambda x: x.distance_km)
+    
+    result = nearby[:limit]
+    
+    # Cache the result
+    cache.set(cache_key, [store.dict() for store in result], TTL_NEARBY_STORES)
+    print(f"✓ Cached: {cache_key} for {TTL_NEARBY_STORES}s")
 
-    return nearby[:limit]
+    return result
 
 
 @router.get("/config")
