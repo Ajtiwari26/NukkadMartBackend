@@ -259,13 +259,15 @@ class MatchedProduct(BaseModel):
     in_stock: bool
     match_confidence: float
     original_query: str
+    search_term_english: Optional[str] = None  # English translation of the query
     matched_quantity: float
     line_total: float
     thumbnail: Optional[str]
     
     # Smart Matching Fields
-    status: str = "perfect"  # "perfect", "size_modified", "brand_suggested"
+    status: str = "perfect"  # "perfect", "size_modified", "brand_suggested", "ambiguous"
     modification_reason: Optional[str] = None
+    alternatives: Optional[List[Dict]] = None  # List of alternative products when ambiguous
 
 
 class ProductMatchResponse(BaseModel):

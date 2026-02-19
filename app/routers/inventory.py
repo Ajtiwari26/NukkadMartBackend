@@ -265,6 +265,33 @@ async def list_store_products(
     )
 
 
+@router.get("/stores/{store_id}/search")
+async def search_store_products(
+    store_id: str,
+    q: str = Query(..., min_length=1, description="Search query"),
+    limit: int = Query(20, ge=1, le=100),
+    service: InventoryService = Depends(get_inventory_service)
+):
+    """
+    Search products in a store by name, brand, or category.
+    Returns products matching the search query with synonym support.
+    """
+    result = await service.list_products(
+        store_id=store_id,
+        search_query=q,
+        page=1,
+        page_size=limit,
+        sort_by="name",
+        sort_order=1
+    )
+
+    return {
+        "results": [ProductResponse(**p.model_dump()) for p in result["products"]],
+        "total": result["total"],
+        "query": q
+    }
+
+
 # ==================== Stock Management ====================
 
 @router.put("/products/{product_id}/stock", response_model=StockUpdateResponse)

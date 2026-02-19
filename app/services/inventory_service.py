@@ -414,15 +414,40 @@ class InventoryService:
         2. Size mismatches (up-selling to next available size)
         3. Vague items (suggesting best-sellers)
         4. Unmatched/Unreadable items
+        5. Synonym matching (yogurt = curd, etc.)
         """
         matched = []
         unmatched = []
         suggestions = []
         cart_total = 0.0
+        
+        # Synonym dictionary for common product name variations
+        SYNONYMS = {
+            'yogurt': ['curd', 'dahi', 'yoghurt', 'yogurt'],
+            'curd': ['yogurt', 'dahi', 'yoghurt', 'curd'],
+            'dahi': ['curd', 'yogurt', 'yoghurt', 'dahi'],
+            'milk': ['doodh', 'dudh', 'milk'],
+            'butter': ['makhan', 'butter', 'makkhan'],
+            'bread': ['pav', 'bread', 'double roti'],
+            'paneer': ['cottage cheese', 'paneer', 'panir'],
+            'ghee': ['clarified butter', 'ghee', 'ghi'],
+            'oil': ['tel', 'oil', 'cooking oil'],
+            'rice': ['chawal', 'rice', 'chaawal'],
+            'sugar': ['cheeni', 'sugar', 'shakkar'],
+            'salt': ['namak', 'salt', 'noon'],
+            'tea': ['chai', 'tea', 'chay'],
+            'biscuit': ['cookie', 'biscuit', 'biskut'],
+        }
+        
+        def get_synonyms(word):
+            """Get all synonyms for a word"""
+            word_lower = word.lower().strip()
+            for key, synonyms in SYNONYMS.items():
+                if word_lower in synonyms or word_lower == key:
+                    return synonyms
+            return [word_lower]
 
         # Get all active products for the store
-        # Optimization: In a real app, we might use vector search or text search
-        # But for Nukkad shops (< 2000 items), in-memory matching is fast enough
         store_products = []
         async for product in self.products.find(
             {"store_id": store_id, "is_active": True, "is_available": True}
@@ -457,11 +482,14 @@ class InventoryService:
                 if unit in ['ml']: return val
                 return 0
 
-            # 1. FIND CANDIDATES
+            # 1. FIND CANDIDATES (with synonym matching)
             candidates = []
+            search_synonyms = get_synonyms(search_term)
+            
             for p in store_products:
-                # Simple containment search
-                if search_term.lower() in p["name"].lower():
+                product_name_lower = p["name"].lower()
+                # Check if search term or any of its synonyms match
+                if any(syn in product_name_lower for syn in search_synonyms):
                     candidates.append(p)
             
             # 2. ANALYZE CANDIDATES (Ambiguity & Pack Matching)
@@ -480,16 +508,27 @@ class InventoryService:
                 
                 # For this demo, let's treat generic queries as Ambiguous
                 if len(candidates) > 3 or (not is_brand_specified and len(candidates) > 1):
-                     # Add to AMBIGUOUS bucket for user checks
-                     # We need to structure this in the response. 
-                     # Current `MatchedProduct` has `status`. We use that.
-                     
-                     # We pick the first one as "primary" but flag it
+                     # Add to AMBIGUOUS bucket for user to choose
+                     # Pick the first one as "primary" but include all alternatives
                      best = candidates[0]
+                     
+                     # Create alternatives list with all candidate products
+                     alternatives = []
+                     for cand in candidates:
+                         alternatives.append({
+                             "product_id": cand["product_id"],
+                             "name": cand["name"],
+                             "brand": cand.get("brand"),
+                             "price": cand["price"],
+                             "mrp": cand.get("mrp", cand["price"]),
+                             "unit": cand["unit"],
+                             "thumbnail": cand.get("thumbnail"),
+                             "stock_quantity": cand["stock_quantity"]
+                         })
                      
                      matched.append(MatchedProduct(
                         product_id=best["product_id"],
-                        name=best["name"], # Use generic name? No, use product name
+                        name=best["name"],
                         brand=best.get("brand"),
                         price=best["price"],
                         mrp=best.get("mrp", best["price"]),
@@ -499,11 +538,13 @@ class InventoryService:
                         in_stock=best["stock_quantity"] > 0,
                         match_confidence=0.6,
                         original_query=raw_text,
+                        search_term_english=search_term,  # Add English translation
                         matched_quantity=req_qty,
                         line_total=best["price"] * req_qty,
                         thumbnail=best.get("thumbnail"),
                         status="ambiguous",
-                        modification_reason=f"Found {len(candidates)} options. Please select."
+                        modification_reason=f"Found {len(candidates)} options. Please select.",
+                        alternatives=alternatives  # Add alternatives here
                     ))
                      continue
                 
@@ -580,6 +621,7 @@ class InventoryService:
                     in_stock=selected_match["stock_quantity"] > 0,
                     match_confidence=item.get("confidence_score", 0.9),
                     original_query=raw_text,
+                    search_term_english=search_term,  # Add English translation
                     matched_quantity=final_qty,
                     line_total=line_total,
                     thumbnail=selected_match.get("thumbnail"),
