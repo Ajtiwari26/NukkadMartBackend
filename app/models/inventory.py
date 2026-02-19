@@ -40,9 +40,9 @@ class StockMovement(BaseModel):
     store_id: str
     product_id: str
     movement_type: StockMovementType
-    quantity: int = Field(..., description="Positive for additions, negative for deductions")
-    previous_quantity: int
-    new_quantity: int
+    quantity: float = Field(..., description="Positive for additions, negative for deductions")
+    previous_quantity: float
+    new_quantity: float
     reference_type: Optional[str] = None  # "order", "procurement", "manual"
     reference_id: Optional[str] = None
     notes: Optional[str] = None
@@ -54,7 +54,7 @@ class StockMovementCreate(BaseModel):
     """Create stock movement record"""
     product_id: str
     movement_type: StockMovementType
-    quantity: int
+    quantity: float
     reference_type: Optional[str] = None
     reference_id: Optional[str] = None
     notes: Optional[str] = None
@@ -69,9 +69,9 @@ class InventoryItem(BaseModel):
     category: str
     sku: Optional[str]
     barcode: Optional[str]
-    current_stock: int
-    reserved_stock: int = 0
-    available_stock: int
+    current_stock: float
+    reserved_stock: float = 0
+    available_stock: float
     reorder_threshold: int
     unit: str
     price: float
@@ -116,10 +116,10 @@ class ProcurementItem(BaseModel):
     product_id: str
     product_name: str
     sku: Optional[str]
-    current_stock: int
+    current_stock: float
     predicted_demand: float
-    recommended_quantity: int
-    ordered_quantity: int = 0
+    recommended_quantity: float
+    ordered_quantity: float = 0
     unit_cost: Optional[float]
     total_cost: Optional[float]
     supplier_sku: Optional[str]
@@ -137,7 +137,7 @@ class ProcurementOrder(BaseModel):
 
     # Totals
     total_items: int
-    total_quantity: int
+    total_quantity: float
     estimated_cost: float
 
     # Status
@@ -191,11 +191,11 @@ class DemandForecast(BaseModel):
     confidence_score: float
 
     # Recommendations
-    current_stock: int
+    current_stock: float
     days_of_stock: int
-    recommended_order_quantity: int
-    safety_stock: int
-    reorder_point: int
+    recommended_order_quantity: float
+    safety_stock: float
+    reorder_point: float
 
     # Factors
     trend: str  # "increasing", "stable", "decreasing"
@@ -235,7 +235,7 @@ class ProductSearchResult(BaseModel):
     price: float
     unit: str
     in_stock: bool
-    stock_quantity: int
+    stock_quantity: float
     match_score: float
     thumbnail: Optional[str]
 
@@ -255,7 +255,7 @@ class MatchedProduct(BaseModel):
     mrp: float
     unit: str
     unit_value: float
-    stock_quantity: int
+    stock_quantity: float
     in_stock: bool
     match_confidence: float
     original_query: str

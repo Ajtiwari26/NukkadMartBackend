@@ -122,7 +122,7 @@ class ProductBase(BaseModel):
 class ProductCreate(ProductBase):
     """Schema for creating a new product"""
     store_id: str
-    stock_quantity: int = Field(default=0, ge=0)
+    stock_quantity: float = Field(default=0, ge=0)
     reorder_threshold: int = Field(default=10, ge=0)
     max_order_quantity: Optional[int] = Field(default=None, ge=1)
 
@@ -165,7 +165,7 @@ class ProductInDB(ProductBase):
     """Product as stored in MongoDB"""
     product_id: str
     store_id: str
-    stock_quantity: int = Field(default=0, ge=0)
+    stock_quantity: float = Field(default=0, ge=0)
     reorder_threshold: int = Field(default=10, ge=0)
     max_order_quantity: Optional[int] = None
 
@@ -230,7 +230,7 @@ class StockOperation(str, Enum):
 
 class StockUpdate(BaseModel):
     """Stock update request"""
-    quantity: int = Field(..., ge=0)
+    quantity: float = Field(..., ge=0)
     operation: StockOperation = Field(default=StockOperation.SET)
     reason: Optional[str] = Field(default=None, description="Reason for stock change")
     reference_id: Optional[str] = Field(default=None, description="Order/procurement ID")
@@ -239,8 +239,8 @@ class StockUpdate(BaseModel):
 class StockUpdateResponse(BaseModel):
     """Stock update response"""
     product_id: str
-    previous_quantity: int
-    new_quantity: int
+    previous_quantity: float
+    new_quantity: float
     operation: StockOperation
     in_stock: bool
     updated_at: datetime
@@ -257,7 +257,7 @@ class InventoryAlert(BaseModel):
     """Low stock or out of stock alert"""
     product_id: str
     product_name: str
-    current_stock: int
+    current_stock: float
     reorder_threshold: int
     alert_type: str  # "low_stock" or "out_of_stock"
     days_until_stockout: Optional[int] = None

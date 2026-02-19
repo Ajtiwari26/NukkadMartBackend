@@ -26,7 +26,7 @@ class OrderItem(BaseModel):
     """Individual item in an order"""
     product_id: str
     name: Optional[str] = None
-    quantity: int = Field(..., gt=0)
+    quantity: float = Field(..., gt=0)
     unit_price: Optional[float] = Field(None, gt=0)
     subtotal: Optional[float] = None
 
