@@ -448,90 +448,184 @@ class InventoryService:
 
             # --- MATCHING LOGIC ---
             
-            # Attempt 1: Exact Name Match
-            best_match = None
+            # Helper: Get weight in grams
+            def get_weight_grams(val, unit):
+                unit = unit.strip().lower()
+                if unit in ['kg', 'kilo']: return val * 1000
+                if unit in ['g', 'gm', 'gms']: return val
+                if unit in ['l', 'ltr']: return val * 1000 # Treat ml as g approx
+                if unit in ['ml']: return val
+                return 0
+
+            # 1. FIND CANDIDATES
+            candidates = []
             for p in store_products:
+                # Simple containment search
                 if search_term.lower() in p["name"].lower():
-                    # Check unit compatibility if possible
-                    # This is a simplified check
-                    best_match = p
-                    break
+                    candidates.append(p)
             
-            if best_match:
-                # Check for size/quantity mismatch
-                # Extract size from product name if possible or use unit
-                # Logic: If user asked for 200g but product is 500g
+            # 2. ANALYZE CANDIDATES (Ambiguity & Pack Matching)
+            selected_match = None
+            status = "perfect"
+            reason = None
+            final_qty = req_qty
+            
+            if len(candidates) > 1:
+                # If multiple matches, check if they are distinct varieties
+                # e.g. "Amul Milk" vs "Mother Dairy Milk" -> Ambiguous
+                # e.g. "Dahi 200g" vs "Dahi 400g" -> Size variants (handled by weight logic)
                 
-                # Simplified logic for demo:
-                # If the product name contains the requested unit but different value, flag it
-                # For now, we'll assume "Perfect Match" if name matches
+                # Heuristic: If candidates differ significantly in name (brands) -> Ambiguous
+                # If candidates differ mostly by weight/price -> Size variants
                 
-                # Check if it's a size mismatch (mock logic for demonstration)
-                status = "perfect"
-                reason = None
+                # For this demo, let's treat generic queries as Ambiguous
+                if len(candidates) > 3 or (not is_brand_specified and len(candidates) > 1):
+                     # Add to AMBIGUOUS bucket for user checks
+                     # We need to structure this in the response. 
+                     # Current `MatchedProduct` has `status`. We use that.
+                     
+                     # We pick the first one as "primary" but flag it
+                     best = candidates[0]
+                     
+                     matched.append(MatchedProduct(
+                        product_id=best["product_id"],
+                        name=best["name"], # Use generic name? No, use product name
+                        brand=best.get("brand"),
+                        price=best["price"],
+                        mrp=best.get("mrp", best["price"]),
+                        unit=best["unit"],
+                        unit_value=best.get("unit_value", 1),
+                        stock_quantity=best["stock_quantity"],
+                        in_stock=best["stock_quantity"] > 0,
+                        match_confidence=0.6,
+                        original_query=raw_text,
+                        matched_quantity=req_qty,
+                        line_total=best["price"] * req_qty,
+                        thumbnail=best.get("thumbnail"),
+                        status="ambiguous",
+                        modification_reason=f"Found {len(candidates)} options. Please select."
+                    ))
+                     continue
                 
-                # Example: req 200g, found 500g
-                # We need structured unit/value in Product model to do this accurately
-                # For now, we will rely on text analysis or assume perfect if name matches
+                # If strict brand specified, maybe filtering candidates reduced count?
+                # Proceed with best candidate logic (closest weight)
+            
+            if candidates:
+                # Find best weight match among candidates
+                best_candidate = candidates[0]
+                min_diff = float('inf')
                 
-                line_total = best_match["price"] * req_qty
+                req_grams = get_weight_grams(req_qty, req_unit)
+                
+                if req_grams > 0:
+                    for cand in candidates:
+                        # Assuming product name has weight like "Paneer 200g" or we have metadata
+                        # Mock extraction of weight from name for demo
+                        import re
+                        match = re.search(r'(\d+)\s*(g|gm|kg|ml|l)', cand["name"], re.IGNORECASE)
+                        cand_grams = 0
+                        if match:
+                            val = float(match.group(1))
+                            u = match.group(2)
+                            cand_grams = get_weight_grams(val, u)
+                        
+                        if cand_grams > 0:
+                            diff = abs(cand_grams - req_grams)
+                            if diff < min_diff:
+                                min_diff = diff
+                                best_candidate = cand
+                            
+                            # Logic: If user wants 249g, and we have 200g and 500g.
+                            # Use 500g? Or 200g? 
+                            # User said: "pack of 349gm... ai should identify... suggest available option is 349gm"
+                    
+                    # Calculate quantity based on best candidate
+                    # If user wants 249g and best is 349g -> Qty 1 (Upsize)
+                    # If user wants 1kg and best is 500g -> Qty 2
+                    
+                    match = re.search(r'(\d+)\s*(g|gm|kg|ml|l)', best_candidate["name"], re.IGNORECASE)
+                    cand_grams = 0
+                    if match:
+                         val = float(match.group(1))
+                         u = match.group(2)
+                         cand_grams = get_weight_grams(val, u)
+                    
+                    if cand_grams > 0:
+                        if req_grams <= cand_grams:
+                            final_qty = 1.0
+                            if req_grams < cand_grams * 0.9: # >10% diff
+                                status = "size_modified"
+                                reason = f"Requested {req_qty}{req_unit}, using standard pack {cand_grams}g"
+                        else:
+                            # User wants more than 1 pack
+                            final_qty = round(req_grams / cand_grams)
+                            if final_qty == 0: final_qty = 1.0
+                            status = "quantity_adjusted"
+                            reason = f"Adding {final_qty} packs of {cand_grams}g to match {req_qty}{req_unit}"
+                
+                selected_match = best_candidate
+                
+                line_total = selected_match["price"] * final_qty
                 cart_total += line_total
 
                 matched.append(MatchedProduct(
-                    product_id=best_match["product_id"],
-                    name=best_match["name"],
-                    brand=best_match.get("brand"),
-                    price=best_match["price"],
-                    mrp=best_match.get("mrp", best_match["price"]),
-                    unit=best_match["unit"],
-                    unit_value=best_match.get("unit_value", 1),
-                    stock_quantity=best_match["stock_quantity"],
-                    in_stock=best_match["stock_quantity"] > 0,
+                    product_id=selected_match["product_id"],
+                    name=selected_match["name"],
+                    brand=selected_match.get("brand"),
+                    price=selected_match["price"],
+                    mrp=selected_match.get("mrp", selected_match["price"]),
+                    unit=selected_match["unit"],
+                    unit_value=selected_match.get("unit_value", 1),
+                    stock_quantity=selected_match["stock_quantity"],
+                    in_stock=selected_match["stock_quantity"] > 0,
                     match_confidence=item.get("confidence_score", 0.9),
                     original_query=raw_text,
-                    matched_quantity=req_qty,
+                    matched_quantity=final_qty,
                     line_total=line_total,
-                    thumbnail=best_match.get("thumbnail"),
+                    thumbnail=selected_match.get("thumbnail"),
                     status=status,
                     modification_reason=reason
                 ))
                 continue
 
-            # Attempt 2: Category/Vague Match (Brand Suggestion)
-            # If no exact match, try to find by category keywords
-            # e.g., "Toothpaste" -> suggest "Colgate"
-            
+            # Attempt 2: Suggestions (Category Match)
             category_match = None
             keywords = search_term.split()
-            for p in store_products:
-                # If any significant keyword matches category or name
-                if any(k.lower() in p["name"].lower() or k.lower() in p.get("category", "").lower() for k in keywords):
-                    category_match = p
-                    break
+            valid_suggestions = []
             
-            if category_match:
-                line_total = category_match["price"] * req_qty
-                cart_total += line_total
-                
-                matched.append(MatchedProduct(
-                    product_id=category_match["product_id"],
-                    name=category_match["name"],
-                    brand=category_match.get("brand"),
-                    price=category_match["price"],
-                    mrp=category_match.get("mrp", category_match["price"]),
-                    unit=category_match["unit"],
-                    unit_value=category_match.get("unit_value", 1),
-                    stock_quantity=category_match["stock_quantity"],
-                    in_stock=category_match["stock_quantity"] > 0,
-                    match_confidence=0.7, # Lower confidence for suggestions
-                    original_query=raw_text,
-                    matched_quantity=req_qty,
-                    line_total=line_total,
-                    thumbnail=category_match.get("thumbnail"),
-                    status="brand_suggested" if not is_brand_specified else "substitute_suggested",
-                    modification_reason=f"Suggested {category_match['name']} for '{search_term}'"
-                ))
-                continue
+            for p in store_products:
+                if any(k.lower() in p.get("category", "").lower() for k in keywords):
+                    valid_suggestions.append(p)
+            
+            # If we found suggestions, add to suggestions list, NOT matched list
+            # User wants "Select dairy one"
+            if valid_suggestions:
+                 # Add to unmatched but with specific suggestions
+                 suggestions.append({
+                     "original_query": raw_text,
+                     "suggestions": [
+                         {
+                             "product_id": p["product_id"],
+                             "name": p["name"],
+                             "price": p["price"],
+                             "thumbnail": p.get("thumbnail")
+                         } for p in valid_suggestions[:3]
+                     ],
+                     "reason": "category_match"
+                 })
+                 
+                 # Also Add to unmatched list so it appears in "Needs Help" but with suggestions?
+                 # No, structured response has separate `suggestions` field.
+                 # Frontend should merge them.
+                 
+                 # Actually, let's put it in `unmatched` with a special flag/data
+                 unmatched.append({
+                    "raw_text": raw_text,
+                    "reason": "ambiguous_category",
+                    "search_term": search_term,
+                    "suggested_products": [p["product_id"] for p in valid_suggestions[:3]] # lightweight
+                 })
+                 continue
 
             # If completely unmatched
             unmatched.append({
