@@ -67,6 +67,7 @@ class OrderResponse(BaseModel):
     """Full order response"""
     order_id: str
     user_id: str
+    customer_name: Optional[str] = None  # Added customer name
     store_id: str
     items: List[dict]
     pricing: OrderPricing

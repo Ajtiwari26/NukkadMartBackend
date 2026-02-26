@@ -449,8 +449,12 @@ class OrderService:
         return order
 
     async def get_order(self, order_id: str) -> Optional[Dict]:
-        """Get order by ID."""
+        """Get order by ID with customer name."""
         order = await self.orders.find_one({"order_id": order_id})
+        if order and order.get("user_id"):
+            user = await self.db.users.find_one({"user_id": order["user_id"]})
+            if user:
+                order["customer_name"] = user.get("name", "Customer")
         return order
 
     async def update_status(
@@ -575,7 +579,7 @@ class OrderService:
         status: Optional[OrderStatus] = None,
         limit: int = 50
     ) -> Dict[str, Any]:
-        """Get orders for a store."""
+        """Get orders for a store with customer names."""
         query = {"store_id": store_id}
         if status:
             query["status"] = status
@@ -583,6 +587,19 @@ class OrderService:
         cursor = self.orders.find(query).sort("created_at", -1).limit(limit)
         orders = await cursor.to_list(length=limit)
         total = await self.orders.count_documents(query)
+
+        # Enrich orders with customer names
+        user_ids = list(set(order.get("user_id") for order in orders if order.get("user_id")))
+        users = {}
+        if user_ids:
+            user_cursor = self.db.users.find({"user_id": {"$in": user_ids}})
+            user_list = await user_cursor.to_list(length=len(user_ids))
+            users = {user["user_id"]: user.get("name", "Customer") for user in user_list}
+        
+        # Add customer names to orders
+        for order in orders:
+            user_id = order.get("user_id")
+            order["customer_name"] = users.get(user_id, "Customer")
 
         return {
             "store_id": store_id,
