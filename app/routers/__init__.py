@@ -7,6 +7,7 @@ from .stores import router as stores_router
 from .users import router as users_router
 from .payments import router as payments_router
 from .ai_products import router as ai_products_router
+from .voice_assistant import router as voice_assistant_router
 
 __all__ = [
     "ocr_router",
@@ -16,5 +17,6 @@ __all__ = [
     "stores_router",
     "users_router",
     "payments_router",
-    "ai_products_router"
+    "ai_products_router",
+    "voice_assistant_router"
 ]

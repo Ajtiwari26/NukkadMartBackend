@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     AWS_SECRET_ACCESS_KEY: Optional[str] = None
     BEDROCK_MODEL_ID: str = "amazon.nova-pro-v1:0"
     BEDROCK_NOVA_ACT_MODEL_ID: str = "amazon.nova-act-v1:0"
+    BEDROCK_NOVA_SONIC_MODEL_ID: str = "amazon.nova-sonic-v1:0"
+
+    # Voice Assistant Configuration
+    ENABLE_VOICE_ASSISTANT: bool = True
+    VOICE_LANGUAGE: str = "hi-IN"
+    VOICE_ENABLE_CODE_SWITCHING: bool = True
 
     # S3 Configuration
     S3_BUCKET_NAME: str = "nukkadmart-images"

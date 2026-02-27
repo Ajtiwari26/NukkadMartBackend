@@ -20,7 +20,8 @@ from app.routers import (
     stores_router,
     users_router,
     payments_router,
-    ai_products_router
+    ai_products_router,
+    voice_assistant_router
 )
 
 # Configure logging
@@ -140,6 +141,7 @@ app.include_router(stores_router, prefix=settings.API_V1_PREFIX)
 app.include_router(users_router, prefix=settings.API_V1_PREFIX)
 app.include_router(payments_router, prefix=settings.API_V1_PREFIX)
 app.include_router(ai_products_router, prefix=settings.API_V1_PREFIX)
+app.include_router(voice_assistant_router, prefix=settings.API_V1_PREFIX, tags=["voice-assistant"])
 
 
 # ==================== Root Endpoints ====================
