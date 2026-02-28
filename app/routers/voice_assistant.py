@@ -1,5 +1,6 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from app.services.nova_sonic_service import NovaSonicService
+from app.services.voice_context_service import VoiceContextService
 import json
 import asyncio
 import logging
@@ -8,15 +9,22 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 @router.websocket("/ws/voice/customer/{user_id}")
-async def customer_voice_assistant(websocket: WebSocket, user_id: str):
+async def customer_voice_assistant(
+    websocket: WebSocket,
+    user_id: str,
+    latitude: float = Query(..., description="User's latitude"),
+    longitude: float = Query(..., description="User's longitude")
+):
     """
     Real-time voice assistant for NukkadMart customers
     Handles bidirectional audio streaming with Nova Sonic
+    Pre-loads nearby stores and inventory in Redis for fast access
     """
     await websocket.accept()
-    logger.info(f"Customer voice session started for user: {user_id}")
+    logger.info(f"Customer voice session started for user: {user_id} at ({latitude}, {longitude})")
     
     nova_sonic = NovaSonicService()
+    context_service = VoiceContextService()
     
     # Initialize session with "Helpful Shopkeeper" persona
     session = await nova_sonic.create_session(
@@ -33,15 +41,41 @@ async def customer_voice_assistant(websocket: WebSocket, user_id: str):
         ]
     )
     
+    # Pre-load context: nearby stores + inventory into Redis
+    try:
+        context_summary = await context_service.initialize_customer_context(
+            session_id=session['id'],
+            user_id=user_id,
+            latitude=latitude,
+            longitude=longitude,
+            radius_km=5.0
+        )
+        
+        # Send context summary to Flutter
+        await websocket.send_text(json.dumps({
+            'event': 'context_loaded',
+            'data': context_summary
+        }))
+        
+        logger.info(f"Context loaded: {context_summary['stores_count']} stores, {context_summary['products_count']} products")
+    except Exception as e:
+        logger.error(f"Error loading context: {str(e)}")
+        await websocket.send_text(json.dumps({
+            'event': 'error',
+            'message': 'Failed to load nearby stores'
+        }))
+    
     try:
         while True:
             # Receive audio chunk from Flutter app
             data = await websocket.receive_bytes()
             
             # Stream to Nova Sonic and get response
+            # Nova Sonic will use context_service for fast data access
             async for response in nova_sonic.stream_conversation(
                 session_id=session['id'],
-                audio_input=data
+                audio_input=data,
+                context_service=context_service  # Pass context service
             ):
                 if response['type'] == 'audio':
                     # Send AI audio response back to Flutter
@@ -54,11 +88,21 @@ async def customer_voice_assistant(websocket: WebSocket, user_id: str):
                         'cart': response['cart']
                     }))
                 
+                elif response['type'] == 'transcription':
+                    # Send transcription for display
+                    await websocket.send_text(json.dumps({
+                        'event': 'transcription',
+                        'text': response['text'],
+                        'is_user': response.get('is_user', False)
+                    }))
+                
     except WebSocketDisconnect:
         logger.info(f"Customer voice session ended for user: {user_id}")
         await nova_sonic.close_session(session['id'])
+        await context_service.cleanup_context(session['id'])
     except Exception as e:
         logger.error(f"Error in customer voice session: {str(e)}")
+        await context_service.cleanup_context(session['id'])
         await websocket.close()
 
 
@@ -67,11 +111,13 @@ async def store_voice_assistant(websocket: WebSocket, store_id: str):
     """
     Real-time voice assistant for NukkadStore owners
     Provides analytics, reports, and business insights
+    Pre-loads store data and analytics in Redis for fast access
     """
     await websocket.accept()
     logger.info(f"Store voice session started for store: {store_id}")
     
     nova_sonic = NovaSonicService()
+    context_service = VoiceContextService()
     
     # Initialize session with "Personal Manager" persona
     session = await nova_sonic.create_session(
@@ -89,15 +135,38 @@ async def store_voice_assistant(websocket: WebSocket, store_id: str):
         ]
     )
     
+    # Pre-load context: store data + analytics into Redis
+    try:
+        context_summary = await context_service.initialize_store_context(
+            session_id=session['id'],
+            store_id=store_id
+        )
+        
+        # Send context summary to Flutter
+        await websocket.send_text(json.dumps({
+            'event': 'context_loaded',
+            'data': context_summary
+        }))
+        
+        logger.info(f"Store context loaded: {context_summary['total_products']} products, ₹{context_summary['today_revenue']} revenue")
+    except Exception as e:
+        logger.error(f"Error loading store context: {str(e)}")
+        await websocket.send_text(json.dumps({
+            'event': 'error',
+            'message': 'Failed to load store data'
+        }))
+    
     try:
         while True:
             # Receive audio chunk from Flutter app
             data = await websocket.receive_bytes()
             
             # Stream to Nova Sonic and get response
+            # Nova Sonic will use context_service for fast data access
             async for response in nova_sonic.stream_conversation(
                 session_id=session['id'],
-                audio_input=data
+                audio_input=data,
+                context_service=context_service  # Pass context service
             ):
                 if response['type'] == 'audio':
                     # Send AI audio response back to Flutter
@@ -110,9 +179,19 @@ async def store_voice_assistant(websocket: WebSocket, store_id: str):
                         'data': response['data']
                     }))
                 
+                elif response['type'] == 'transcription':
+                    # Send transcription for display
+                    await websocket.send_text(json.dumps({
+                        'event': 'transcription',
+                        'text': response['text'],
+                        'is_user': response.get('is_user', False)
+                    }))
+                
     except WebSocketDisconnect:
         logger.info(f"Store voice session ended for store: {store_id}")
         await nova_sonic.close_session(session['id'])
+        await context_service.cleanup_context(session['id'])
     except Exception as e:
         logger.error(f"Error in store voice session: {str(e)}")
+        await context_service.cleanup_context(session['id'])
         await websocket.close()
