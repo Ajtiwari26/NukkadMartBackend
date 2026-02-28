@@ -712,3 +712,51 @@ async def record_udhaar_payment(store_id: str, user_id: str, amount: float):
         "new_balance": result.get("balance", 0),
         "message": f"Payment of Rs {amount} recorded"
     }
+
+
+# ==================== Store Deletion ====================
+
+@router.delete("/{store_id}")
+async def delete_store(store_id: str):
+    """
+    Delete a store and all its associated data (CASCADE DELETE).
+    
+    Deletes:
+    - Store document
+    - All products linked to this store
+    - All inventory records
+    - All orders
+    - All udhaar records
+    """
+    db = await get_database()
+    
+    # Check if store exists
+    store = await db.stores.find_one({"_id": store_id})
+    if not store:
+        raise HTTPException(status_code=404, detail="Store not found")
+    
+    store_name = store.get("name", "Unknown")
+    
+    # Delete all associated data (CASCADE)
+    products_deleted = await db.products.delete_many({"store_id": store_id})
+    inventory_deleted = await db.inventory.delete_many({"store_id": store_id})
+    orders_deleted = await db.orders.delete_many({"store_id": store_id})
+    udhaar_deleted = await db.udhaar.delete_many({"store_id": store_id})
+    
+    # Delete the store itself
+    await db.stores.delete_one({"_id": store_id})
+    
+    # Clear cache
+    await cache.delete(f"store:{store_id}")
+    
+    return {
+        "success": True,
+        "message": f"Store '{store_name}' deleted successfully",
+        "deleted": {
+            "store": 1,
+            "products": products_deleted.deleted_count,
+            "inventory": inventory_deleted.deleted_count,
+            "orders": orders_deleted.deleted_count,
+            "udhaar": udhaar_deleted.deleted_count
+        }
+    }

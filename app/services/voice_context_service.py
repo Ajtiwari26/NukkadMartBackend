@@ -22,8 +22,14 @@ class VoiceContextService:
     
     def __init__(self):
         self.redis = RedisClient
-        self.db = get_database()
+        self.db = None  # Will be initialized on first use
         self.context_ttl = 1800  # 30 minutes
+    
+    async def _get_db(self):
+        """Get database connection (lazy initialization)"""
+        if self.db is None:
+            self.db = await get_database()
+        return self.db
     
     async def initialize_customer_context(
         self,
@@ -91,6 +97,97 @@ class VoiceContextService:
             "user_favorites": user_data.get("favorites", [])
         }
     
+    async def initialize_from_app_data(
+        self,
+        session_id: str,
+        user_id: str,
+        latitude: float,
+        longitude: float,
+        stores_data: List[Dict]
+    ) -> Dict:
+        """
+        Initialize context from data already loaded by Flutter app
+        NO API CALLS - uses data sent from app
+        Optimized for zero backend calls
+        
+        Returns context summary for AI
+        """
+        logger.info(f"Initializing context from app data for session {session_id}")
+        
+        context = {
+            "session_id": session_id,
+            "user_id": user_id,
+            "location": {"lat": latitude, "lon": longitude},
+            "initialized_at": datetime.now().isoformat(),
+            "nearby_stores": [],
+            "available_products": [],
+            "product_index": {},
+            "brand_index": {},
+            "category_index": {}
+        }
+        
+        # 1. Process stores data from app
+        nearby_stores = []
+        all_products = []
+        
+        for store_data in stores_data:
+            store_info = {
+                "id": store_data.get('id'),
+                "name": store_data.get('name'),
+                "distance_km": store_data.get('distance', 0),
+                "rating": store_data.get('rating', 4.0)
+            }
+            nearby_stores.append(store_info)
+            
+            # Extract products from store data if available
+            if 'products' in store_data:
+                for p in store_data['products']:
+                    weight_in_grams = self._parse_weight(p.get('weight', p.get('unit', '1 piece')))
+                    price_per_100g = (p['price'] / weight_in_grams * 100) if weight_in_grams > 0 else 0
+                    
+                    all_products.append({
+                        "id": p.get('id'),
+                        "store_id": store_data.get('id'),
+                        "name": p.get('name'),
+                        "brand": p.get('brand', 'Local'),
+                        "category": p.get('category', 'General'),
+                        "price": p.get('price', 0),
+                        "weight": p.get('weight', p.get('unit', '1 piece')),
+                        "weight_grams": weight_in_grams,
+                        "price_per_100g": round(price_per_100g, 2),
+                        "stock": p.get('stock', 0),
+                        "quality_rating": p.get('quality_rating', 4.0),
+                        "benefits": p.get('benefits', []),
+                        "drawbacks": p.get('drawbacks', []),
+                        "description": p.get('description', ''),
+                        "is_premium": p.get('brand', 'Local') in ['Tata', 'Amul', 'Britannia', 'Nestle', 'ITC', 'Parle'],
+                        "tags": p.get('tags', [])
+                    })
+        
+        context["nearby_stores"] = nearby_stores
+        logger.info(f"Loaded {len(nearby_stores)} stores from app data")
+        
+        # 2. Deduplicate products
+        unique_products = self._deduplicate_products(all_products)
+        context["available_products"] = unique_products
+        logger.info(f"Processed {len(unique_products)} unique products from app data")
+        
+        # 3. Build search indexes
+        context["product_index"] = self._build_product_index(unique_products)
+        context["brand_index"] = self._build_brand_index(unique_products)
+        context["category_index"] = self._build_category_index(unique_products)
+        
+        # 4. Store in Redis with TTL
+        await self._store_context_in_redis(session_id, context)
+        
+        # 5. Return summary
+        return {
+            "stores_count": len(nearby_stores),
+            "products_count": len(unique_products),
+            "categories": list(context["category_index"].keys()),
+            "top_brands": list(context["brand_index"].keys())[:20]
+        }
+    
     async def initialize_store_context(
         self,
         session_id: str,
@@ -115,7 +212,8 @@ class VoiceContextService:
         }
         
         # 1. Load store information
-        store = await self.db.stores.find_one({"_id": ObjectId(store_id)})
+        db = await self._get_db()
+        store = await db.stores.find_one({"_id": ObjectId(store_id)})
         if store:
             context["store_info"] = {
                 "id": str(store["_id"]),
@@ -250,7 +348,8 @@ class VoiceContextService:
     ) -> List[Dict]:
         """Find stores within radius"""
         # MongoDB geospatial query
-        stores = await self.db.stores.find({
+        db = await self._get_db()
+        stores = await db.stores.find({
             "location": {
                 "$near": {
                     "$geometry": {
@@ -279,7 +378,8 @@ class VoiceContextService:
     
     async def _load_store_inventory(self, store_id: str) -> List[Dict]:
         """Load all products from a store"""
-        products = await self.db.products.find({
+        db = await self._get_db()
+        products = await db.products.find({
             "store_id": store_id,
             "is_active": True
         }).to_list(length=1000)
@@ -375,12 +475,23 @@ class VoiceContextService:
     
     async def _load_user_data(self, user_id: str) -> Dict:
         """Load user preferences and history"""
-        user = await self.db.users.find_one({"_id": ObjectId(user_id)})
+        db = await self._get_db()
+        
+        # Try to find user by string ID or ObjectId
+        try:
+            if len(user_id) == 24:  # Might be ObjectId
+                user = await db.users.find_one({"_id": ObjectId(user_id)})
+            else:
+                user = await db.users.find_one({"user_id": user_id})
+        except:
+            # If user not found, return empty data
+            return {}
+            
         if not user:
             return {}
         
         # Get recent purchases
-        recent_orders = await self.db.orders.find({
+        recent_orders = await db.orders.find({
             "user_id": user_id,
             "status": "completed"
         }).sort("created_at", -1).limit(10).to_list(length=10)
@@ -401,7 +512,8 @@ class VoiceContextService:
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         tomorrow = today + timedelta(days=1)
         
-        orders = await self.db.orders.find({
+        db = await self._get_db()
+        orders = await db.orders.find({
             "store_id": store_id,
             "created_at": {"$gte": today, "$lt": tomorrow},
             "status": {"$in": ["completed", "delivered"]}

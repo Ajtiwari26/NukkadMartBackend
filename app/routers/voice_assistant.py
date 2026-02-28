@@ -18,7 +18,7 @@ async def customer_voice_assistant(
     """
     Real-time voice assistant for NukkadMart customers
     Handles bidirectional audio streaming with Nova Sonic
-    Pre-loads nearby stores and inventory in Redis for fast access
+    Loads nearby stores and inventory from database into Redis
     """
     await websocket.accept()
     logger.info(f"Customer voice session started for user: {user_id} at ({latitude}, {longitude})")
@@ -41,14 +41,14 @@ async def customer_voice_assistant(
         ]
     )
     
-    # Pre-load context: nearby stores + inventory into Redis
+    # Pre-load context: nearby stores + inventory into Redis (ONE TIME)
     try:
         context_summary = await context_service.initialize_customer_context(
             session_id=session['id'],
             user_id=user_id,
             latitude=latitude,
             longitude=longitude,
-            radius_km=5.0
+            radius_km=10.0
         )
         
         # Send context summary to Flutter
@@ -67,34 +67,33 @@ async def customer_voice_assistant(
     
     try:
         while True:
-            # Receive audio chunk from Flutter app
-            data = await websocket.receive_bytes()
+            # Receive data from Flutter app
+            data = await websocket.receive()
             
-            # Stream to Nova Sonic and get response
-            # Nova Sonic will use context_service for fast data access
-            async for response in nova_sonic.stream_conversation(
-                session_id=session['id'],
-                audio_input=data,
-                context_service=context_service  # Pass context service
-            ):
-                if response['type'] == 'audio':
-                    # Send AI audio response back to Flutter
-                    await websocket.send_bytes(response['data'])
+            # Handle audio data (bytes)
+            if 'bytes' in data:
+                audio_chunk = data['bytes']
                 
-                elif response['type'] == 'cart_update':
-                    # Send cart update as JSON
-                    await websocket.send_text(json.dumps({
-                        'event': 'cart_update',
-                        'cart': response['cart']
-                    }))
+                # Get context from Redis
+                context = await context_service.get_context(session['id'])
                 
-                elif response['type'] == 'transcription':
-                    # Send transcription for display
-                    await websocket.send_text(json.dumps({
-                        'event': 'transcription',
-                        'text': response['text'],
-                        'is_user': response.get('is_user', False)
-                    }))
+                # Stream to hybrid pipeline
+                async for response in nova_sonic.stream_conversation(
+                    session_id=session['id'],
+                    audio_input=audio_chunk,
+                    context=context
+                ):
+                    if response['type'] == 'audio_output':
+                        # Send AI audio back to Flutter (MP3 format)
+                        await websocket.send_bytes(response['data'])
+                    
+                    elif response['type'] == 'transcript':
+                        # Send transcript (user or AI)
+                        await websocket.send_text(json.dumps({
+                            'event': 'transcript',
+                            'text': response['text'],
+                            'is_user': response.get('is_user', False)
+                        }))
                 
     except WebSocketDisconnect:
         logger.info(f"Customer voice session ended for user: {user_id}")

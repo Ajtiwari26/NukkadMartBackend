@@ -16,8 +16,11 @@ pymongo==4.6.1         # MongoDB driver
 # Using Upstash Redis REST API via httpx (no redis package needed)
 
 # AWS SDK for Bedrock/Nova
-boto3==1.34.34
-botocore==1.34.34
+boto3>=1.34.34
+botocore>=1.34.34
+
+# AWS Nova Sonic Bidirectional Streaming SDK (requires Python 3.12+)
+aws-sdk-bedrock-runtime>=0.4.0
 
 # AI Services
 groq==0.4.2            # Groq API client
