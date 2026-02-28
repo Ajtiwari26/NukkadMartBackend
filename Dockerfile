@@ -2,7 +2,7 @@
 # Multi-stage build for optimized production image
 
 # ==================== Build Stage ====================
-FROM python:3.11-slim as builder
+FROM python:3.12-slim as builder
 
 WORKDIR /app
 
@@ -18,7 +18,7 @@ RUN pip wheel --no-cache-dir --no-deps --wheel-dir /app/wheels -r requirements.t
 
 
 # ==================== Production Stage ====================
-FROM python:3.11-slim as production
+FROM python:3.12-slim as production
 
 WORKDIR /app
 
