@@ -3,10 +3,89 @@ from app.services.nova_sonic_service import NovaSonicService
 from app.services.voice_context_service import VoiceContextService
 import json
 import asyncio
+import re
 import logging
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def parse_cart_action_from_transcript(text: str, products: list) -> dict | None:
+    """
+    Parse AI assistant transcript for cart add/remove intent.
+    Matches product names from context and extracts quantity.
+    
+    Returns: {action, product, quantity} or None
+    """
+    text_lower = text.lower().strip()
+    
+    # Cart-add intent keywords (Hindi/Hinglish/English)
+    add_keywords = [
+        'add ho gaya', 'add kar diya', 'add kiya', 'cart mein',
+        'daal diya', 'dal diya', 'add ho gaye', 'add kar diye',
+        'added', 'add ho', 'jod diya', 'rakh diya',
+        'packet cart', 'cart me', 'add karta', 'add karti',
+    ]
+    
+    is_add = any(kw in text_lower for kw in add_keywords)
+    if not is_add:
+        return None
+    
+    # Extract quantity (Hindi numbers)
+    quantity = 1.0
+    hindi_numbers = {
+        'ek': 1, 'do': 2, 'teen': 3, 'char': 4, 'paanch': 5,
+        'panch': 5, 'cheh': 6, 'saat': 7, 'aath': 8, 'nau': 9, 'das': 10,
+        'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+    }
+    
+    for word, num in hindi_numbers.items():
+        if word in text_lower.split():
+            quantity = float(num)
+            break
+    
+    # Also check for digit numbers
+    digit_match = re.search(r'(\d+)\s*(packet|piece|kg|litre|liter)', text_lower)
+    if digit_match:
+        quantity = float(digit_match.group(1))
+    
+    # Match product from context
+    best_match = None
+    best_score = 0
+    
+    for product in products:
+        product_name = product.get('name', '').lower()
+        product_words = set(product_name.split())
+        text_words = set(text_lower.split())
+        
+        # Check how many product name words appear in the transcript
+        matching_words = product_words & text_words
+        if len(matching_words) > 0:
+            score = len(matching_words) / len(product_words) if product_words else 0
+            
+            # Bonus for exact substring match
+            if product_name in text_lower:
+                score += 1.0
+            
+            # Also check brand
+            brand = product.get('brand', '').lower()
+            if brand and brand in text_lower:
+                score += 0.5
+            
+            if score > best_score:
+                best_score = score
+                best_match = product
+    
+    if best_match and best_score >= 0.3:
+        logger.info(f"🛒 Cart action: ADD {quantity}x {best_match['name']} (score: {best_score:.2f})")
+        return {
+            'action': 'add',
+            'product': best_match,
+            'quantity': quantity,
+        }
+    
+    return None
+
 
 @router.websocket("/ws/voice/customer/{user_id}")
 async def customer_voice_assistant(
@@ -18,7 +97,6 @@ async def customer_voice_assistant(
     """
     Real-time voice assistant for NukkadMart customers
     Handles bidirectional audio streaming with Nova Sonic
-    Loads nearby stores and inventory from database into Redis
     """
     await websocket.accept()
     logger.info(f"Customer voice session started for user: {user_id} at ({latitude}, {longitude})")
@@ -41,17 +119,19 @@ async def customer_voice_assistant(
         ]
     )
     
-    # Pre-load context: nearby stores + inventory into Redis (ONE TIME)
+    session_id = session['id']
+    context_products = []  # Products from context for cart matching
+    
+    # Pre-load context: nearby stores + inventory
     try:
         context_summary = await context_service.initialize_customer_context(
-            session_id=session['id'],
+            session_id=session_id,
             user_id=user_id,
             latitude=latitude,
             longitude=longitude,
             radius_km=10.0
         )
         
-        # Send context summary to Flutter
         await websocket.send_text(json.dumps({
             'event': 'context_loaded',
             'data': context_summary
@@ -65,132 +145,226 @@ async def customer_voice_assistant(
             'message': 'Failed to load nearby stores'
         }))
     
+    # Send context to Nova Sonic and keep product list for cart matching
+    try:
+        context = await context_service.get_context(session_id)
+        if context:
+            await nova_sonic.send_context(session_id, context)
+            context_products = context.get('available_products', [])
+            logger.info(f"Context sent to Nova Sonic ({len(context_products)} products for cart matching)")
+    except Exception as e:
+        logger.error(f"Error sending context to Nova Sonic: {e}")
+    
+    # Background response processing
+    response_queue = asyncio.Queue()
+    
+    async def process_responses():
+        try:
+            async for response in nova_sonic.receive_responses(session_id):
+                await response_queue.put(response)
+        except Exception as e:
+            logger.error(f"Response processing error: {e}")
+            await response_queue.put(None)
+    
+    response_task = asyncio.create_task(process_responses())
+    
+    async def forward_responses():
+        """Forward responses + intercept AI transcripts for cart actions"""
+        try:
+            while True:
+                response = await response_queue.get()
+                if response is None:
+                    break
+                    
+                if response['type'] == 'audio_output':
+                    await websocket.send_bytes(response['data'])
+                elif response['type'] == 'transcript':
+                    # Forward transcript
+                    await websocket.send_text(json.dumps({
+                        'event': 'transcript',
+                        'text': response['text'],
+                        'is_user': response.get('is_user', False)
+                    }))
+                    
+                    # Check AI transcripts for cart add/remove actions
+                    if not response.get('is_user', False) and context_products:
+                        cart_action = parse_cart_action_from_transcript(
+                            response['text'], context_products
+                        )
+                        if cart_action:
+                            product = cart_action['product']
+                            store_id = product.get('store_id', '')
+                            
+                            # Send cart_update to Flutter
+                            await websocket.send_text(json.dumps({
+                                'event': 'cart_update',
+                                'action': 'add',
+                                'store_id': store_id,
+                                'quantity': cart_action['quantity'],
+                                'product': {
+                                    'product_id': product.get('id', product.get('product_id', '')),
+                                    'store_id': store_id,
+                                    'name': product.get('name', ''),
+                                    'category': product.get('category', 'General'),
+                                    'brand': product.get('brand'),
+                                    'price': product.get('price', 0),
+                                    'unit': product.get('weight', product.get('unit')),
+                                    'stock_quantity': product.get('stock', 0),
+                                    'image_url': product.get('image_url'),
+                                    'tags': product.get('tags', []),
+                                }
+                            }))
+                            logger.info(f"🛒 Sent cart_update: {cart_action['quantity']}x {product['name']}")
+        except Exception as e:
+            logger.error(f"Response forwarding error: {e}")
+    
+    forward_task = asyncio.create_task(forward_responses())
+    
+    # Audio streaming
+    audio_started = False
+    
     try:
         while True:
-            # Receive data from Flutter app
             data = await websocket.receive()
             
-            # Handle audio data (bytes)
             if 'bytes' in data:
                 audio_chunk = data['bytes']
-                
-                # Get context from Redis
-                context = await context_service.get_context(session['id'])
-                
-                # Stream to hybrid pipeline
-                async for response in nova_sonic.stream_conversation(
-                    session_id=session['id'],
-                    audio_input=audio_chunk,
-                    context=context
-                ):
-                    if response['type'] == 'audio_output':
-                        # Send AI audio back to Flutter (MP3 format)
-                        await websocket.send_bytes(response['data'])
-                    
-                    elif response['type'] == 'transcript':
-                        # Send transcript (user or AI)
-                        await websocket.send_text(json.dumps({
-                            'event': 'transcript',
-                            'text': response['text'],
-                            'is_user': response.get('is_user', False)
-                        }))
+                if not audio_started:
+                    await nova_sonic.start_audio_input(session_id)
+                    audio_started = True
+                await nova_sonic.send_audio_chunk(session_id, audio_chunk)
+            
+            elif 'text' in data:
+                try:
+                    message = json.loads(data['text'])
+                    if message.get('event') == 'end_audio':
+                        if audio_started:
+                            await nova_sonic.end_audio_input(session_id)
+                            audio_started = False
+                    elif message.get('event') == 'start_audio':
+                        if not audio_started:
+                            await nova_sonic.start_audio_input(session_id)
+                            audio_started = True
+                except json.JSONDecodeError:
+                    pass
                 
     except WebSocketDisconnect:
         logger.info(f"Customer voice session ended for user: {user_id}")
-        await nova_sonic.close_session(session['id'])
-        await context_service.cleanup_context(session['id'])
     except Exception as e:
         logger.error(f"Error in customer voice session: {str(e)}")
-        await context_service.cleanup_context(session['id'])
-        await websocket.close()
+    finally:
+        if audio_started:
+            try:
+                await nova_sonic.end_audio_input(session_id)
+            except Exception:
+                pass
+        
+        response_task.cancel()
+        forward_task.cancel()
+        await nova_sonic.close_session(session_id)
+        await context_service.cleanup_context(session_id)
+        
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @router.websocket("/ws/voice/store/{store_id}")
 async def store_voice_assistant(websocket: WebSocket, store_id: str):
-    """
-    Real-time voice assistant for NukkadStore owners
-    Provides analytics, reports, and business insights
-    Pre-loads store data and analytics in Redis for fast access
-    """
+    """Voice assistant for NukkadStore owners"""
     await websocket.accept()
     logger.info(f"Store voice session started for store: {store_id}")
     
     nova_sonic = NovaSonicService()
     context_service = VoiceContextService()
     
-    # Initialize session with "Personal Manager" persona
     session = await nova_sonic.create_session(
         user_id=store_id,
         persona="personal_manager",
-        tools=[
-            "get_sales_report",
-            "get_inventory_status",
-            "get_low_stock_alerts",
-            "suggest_pricing",
-            "forecast_demand",
-            "get_revenue_analytics",
-            "get_top_products",
-            "get_daily_summary"
-        ]
+        tools=["get_sales_report", "get_inventory_status", "get_low_stock_alerts",
+               "suggest_pricing", "forecast_demand", "get_revenue_analytics",
+               "get_top_products", "get_daily_summary"]
     )
     
-    # Pre-load context: store data + analytics into Redis
-    try:
-        context_summary = await context_service.initialize_store_context(
-            session_id=session['id'],
-            store_id=store_id
-        )
-        
-        # Send context summary to Flutter
-        await websocket.send_text(json.dumps({
-            'event': 'context_loaded',
-            'data': context_summary
-        }))
-        
-        logger.info(f"Store context loaded: {context_summary['total_products']} products, ₹{context_summary['today_revenue']} revenue")
-    except Exception as e:
-        logger.error(f"Error loading store context: {str(e)}")
-        await websocket.send_text(json.dumps({
-            'event': 'error',
-            'message': 'Failed to load store data'
-        }))
+    session_id = session['id']
     
     try:
-        while True:
-            # Receive audio chunk from Flutter app
-            data = await websocket.receive_bytes()
-            
-            # Stream to Nova Sonic and get response
-            # Nova Sonic will use context_service for fast data access
-            async for response in nova_sonic.stream_conversation(
-                session_id=session['id'],
-                audio_input=data,
-                context_service=context_service  # Pass context service
-            ):
-                if response['type'] == 'audio':
-                    # Send AI audio response back to Flutter
+        context_summary = await context_service.initialize_store_context(
+            session_id=session_id, store_id=store_id
+        )
+        await websocket.send_text(json.dumps({
+            'event': 'context_loaded', 'data': context_summary
+        }))
+    except Exception as e:
+        logger.error(f"Error loading store context: {str(e)}")
+    
+    response_queue = asyncio.Queue()
+    
+    async def process_responses():
+        try:
+            async for response in nova_sonic.receive_responses(session_id):
+                await response_queue.put(response)
+        except Exception as e:
+            logger.error(f"Response processing error: {e}")
+            await response_queue.put(None)
+    
+    response_task = asyncio.create_task(process_responses())
+    
+    async def forward_responses():
+        try:
+            while True:
+                response = await response_queue.get()
+                if response is None:
+                    break
+                if response['type'] == 'audio_output':
                     await websocket.send_bytes(response['data'])
-                
-                elif response['type'] == 'insight':
-                    # Send business insight as JSON
+                elif response['type'] in ('transcript', 'transcription'):
                     await websocket.send_text(json.dumps({
-                        'event': 'insight',
-                        'data': response['data']
-                    }))
-                
-                elif response['type'] == 'transcription':
-                    # Send transcription for display
-                    await websocket.send_text(json.dumps({
-                        'event': 'transcription',
+                        'event': 'transcript',
                         'text': response['text'],
                         'is_user': response.get('is_user', False)
                     }))
-                
+        except Exception as e:
+            logger.error(f"Response forwarding error: {e}")
+    
+    forward_task = asyncio.create_task(forward_responses())
+    audio_started = False
+    
+    try:
+        while True:
+            data = await websocket.receive()
+            if 'bytes' in data:
+                if not audio_started:
+                    await nova_sonic.start_audio_input(session_id)
+                    audio_started = True
+                await nova_sonic.send_audio_chunk(session_id, data['bytes'])
+            elif 'text' in data:
+                try:
+                    message = json.loads(data['text'])
+                    if message.get('event') == 'end_audio' and audio_started:
+                        await nova_sonic.end_audio_input(session_id)
+                        audio_started = False
+                    elif message.get('event') == 'start_audio' and not audio_started:
+                        await nova_sonic.start_audio_input(session_id)
+                        audio_started = True
+                except json.JSONDecodeError:
+                    pass
     except WebSocketDisconnect:
         logger.info(f"Store voice session ended for store: {store_id}")
-        await nova_sonic.close_session(session['id'])
-        await context_service.cleanup_context(session['id'])
     except Exception as e:
         logger.error(f"Error in store voice session: {str(e)}")
-        await context_service.cleanup_context(session['id'])
-        await websocket.close()
+    finally:
+        if audio_started:
+            try:
+                await nova_sonic.end_audio_input(session_id)
+            except Exception:
+                pass
+        response_task.cancel()
+        forward_task.cancel()
+        await nova_sonic.close_session(session_id)
+        await context_service.cleanup_context(session_id)
+        try:
+            await websocket.close()
+        except Exception:
+            pass

@@ -211,14 +211,20 @@ class VoiceContextService:
             "analytics": {}
         }
         
-        # 1. Load store information
+        # 1. Load store information (use custom store_id, not MongoDB _id)
         db = await self._get_db()
-        store = await db.stores.find_one({"_id": ObjectId(store_id)})
+        store = await db.stores.find_one({"store_id": store_id})
+        if not store:
+            # Fallback: try ObjectId
+            try:
+                store = await db.stores.find_one({"_id": ObjectId(store_id)})
+            except Exception:
+                pass
         if store:
             context["store_info"] = {
-                "id": str(store["_id"]),
+                "id": store.get("store_id", str(store["_id"])),
                 "name": store.get("name"),
-                "location": store.get("location"),
+                "location": store.get("address", {}).get("coordinates"),
                 "owner": store.get("owner_name")
             }
         
@@ -347,34 +353,49 @@ class VoiceContextService:
         radius_km: float
     ) -> List[Dict]:
         """Find stores within radius"""
-        # MongoDB geospatial query
         db = await self._get_db()
-        stores = await db.stores.find({
-            "location": {
-                "$near": {
-                    "$geometry": {
-                        "type": "Point",
-                        "coordinates": [longitude, latitude]
-                    },
-                    "$maxDistance": radius_km * 1000  # Convert to meters
-                }
-            },
-            "is_active": True
-        }).limit(10).to_list(length=10)
         
-        return [
-            {
-                "id": str(store["_id"]),
+        # Try geospatial query first
+        try:
+            stores = await db.stores.find({
+                "address.coordinates": {
+                    "$near": {
+                        "$geometry": {
+                            "type": "Point",
+                            "coordinates": [longitude, latitude]
+                        },
+                        "$maxDistance": radius_km * 1000
+                    }
+                },
+                "status": "ACTIVE"
+            }).limit(10).to_list(length=10)
+        except Exception as e:
+            logger.warning(f"Geospatial query failed: {e}, falling back to all active stores")
+            stores = await db.stores.find({"status": "ACTIVE"}).limit(10).to_list(length=10)
+        
+        result = []
+        for store in stores:
+            # Use custom store_id, NOT MongoDB _id
+            sid = store.get("store_id", str(store["_id"]))
+            
+            # Extract coordinates from nested address structure
+            coords = store.get("address", {}).get("coordinates", {})
+            if coords.get("type") == "Point":
+                store_lng, store_lat = coords.get("coordinates", [0, 0])
+            else:
+                store_lat = coords.get("lat", 0)
+                store_lng = coords.get("lng", 0)
+            
+            distance = self._calculate_distance(latitude, longitude, store_lat, store_lng)
+            
+            result.append({
+                "id": sid,
                 "name": store.get("name"),
-                "distance_km": self._calculate_distance(
-                    latitude, longitude,
-                    store["location"]["coordinates"][1],
-                    store["location"]["coordinates"][0]
-                ),
+                "distance_km": round(distance, 2),
                 "rating": store.get("rating", 4.0)
-            }
-            for store in stores
-        ]
+            })
+        
+        return result
     
     async def _load_store_inventory(self, store_id: str) -> List[Dict]:
         """Load all products from a store"""
@@ -399,7 +420,7 @@ class VoiceContextService:
                 "weight": p.get('weight', p.get('unit', '1 piece')),
                 "weight_grams": weight_in_grams,
                 "price_per_100g": round(price_per_100g, 2),
-                "stock": p.get('stock', 0),
+                "stock": p.get('stock_quantity', p.get('stock', 0)),
                 "quality_rating": p.get('quality_rating', 4.0),
                 "benefits": p.get('benefits', []),
                 "drawbacks": p.get('drawbacks', []),

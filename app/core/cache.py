@@ -7,6 +7,9 @@ import httpx
 from typing import Optional, Any, List
 from datetime import timedelta
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class CacheManager:
     """Upstash Redis cache manager for optimizing API responses"""

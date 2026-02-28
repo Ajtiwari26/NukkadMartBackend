@@ -193,21 +193,80 @@ class NovaSonicService:
         logger.info(f"Created Nova Sonic session {session_id} for user {user_id}")
         return self.sessions[session_id]
 
+    async def send_context(self, session_id: str, context: Dict):
+        """Send inventory/store context to Nova Sonic as a text message (once per session)."""
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        stream = session['stream']
+        ctx_content_name = str(uuid.uuid4())
+
+        products = context.get('available_products', [])
+        if not products:
+            return
+
+        products_list = []
+        for p in products[:20]:
+            products_list.append(
+                f"- {p.get('name')} ({p.get('brand', 'Local')}) - ₹{p.get('price')} "
+                f"[stock: {p.get('stock', 0)}]"
+            )
+
+        context_text = (
+            "AVAILABLE PRODUCTS IN NEARBY STORES:\n" +
+            "\n".join(products_list)
+        )
+
+        # contentStart (TEXT, USER)
+        await self._send_event(stream, json.dumps({
+            "event": {
+                "contentStart": {
+                    "promptName": session['prompt_name'],
+                    "contentName": ctx_content_name,
+                    "type": "TEXT",
+                    "interactive": False,
+                    "role": "USER",
+                    "textInputConfiguration": {"mediaType": "text/plain"}
+                }
+            }
+        }))
+        # textInput
+        await self._send_event(stream, json.dumps({
+            "event": {
+                "textInput": {
+                    "promptName": session['prompt_name'],
+                    "contentName": ctx_content_name,
+                    "content": context_text
+                }
+            }
+        }))
+        # contentEnd
+        await self._send_event(stream, json.dumps({
+            "event": {
+                "contentEnd": {
+                    "promptName": session['prompt_name'],
+                    "contentName": ctx_content_name
+                }
+            }
+        }))
+        logger.info(f"Sent context ({len(products)} products) to Nova Sonic session {session_id}")
+
     async def start_audio_input(self, session_id: str):
-        """Start the audio input content stream for a session."""
+        """Start a new audio input content stream (generates unique content name each time)."""
         session = self.sessions.get(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
 
-        stream = session['stream']
-        prompt_name = session['prompt_name']
-        audio_content_name = session['audio_content_name']
+        # Generate a new unique content name for each audio block
+        audio_content_name = str(uuid.uuid4())
+        session['audio_content_name'] = audio_content_name
 
-        # Start audio content
+        stream = session['stream']
         await self._send_event(stream, json.dumps({
             "event": {
                 "contentStart": {
-                    "promptName": prompt_name,
+                    "promptName": session['prompt_name'],
                     "contentName": audio_content_name,
                     "type": "AUDIO",
                     "interactive": True,
@@ -223,7 +282,7 @@ class NovaSonicService:
                 }
             }
         }))
-        logger.info(f"Audio input started for session {session_id}")
+        logger.info(f"Audio input started for session {session_id} (content: {audio_content_name[:8]}...)")
 
     async def send_audio_chunk(self, session_id: str, audio_bytes: bytes):
         """Send an audio chunk to Nova Sonic."""
@@ -245,7 +304,7 @@ class NovaSonicService:
         }))
 
     async def end_audio_input(self, session_id: str):
-        """End the audio input content stream."""
+        """End the current audio input content stream."""
         session = self.sessions.get(session_id)
         if not session:
             return
@@ -261,90 +320,24 @@ class NovaSonicService:
         }))
         logger.info(f"Audio input ended for session {session_id}")
 
-    async def stream_conversation(
-        self,
-        session_id: str,
-        audio_input: bytes,
-        context: Optional[Dict] = None
-    ) -> AsyncGenerator[Dict, None]:
+    async def receive_responses(self, session_id: str) -> AsyncGenerator[Dict, None]:
         """
-        Process an audio chunk through the Nova Sonic bidirectional stream.
-        
-        Pipeline:
-        1. Send audio to Nova Sonic
-        2. Receive transcription + audio response events
-        3. Yield events back to the WebSocket handler
+        Continuously receive and yield response events from Nova Sonic.
+        Runs as a background task — yields transcripts and audio output.
         """
-
         session = self.sessions.get(session_id)
         if not session:
-            raise ValueError(f"Session {session_id} not found")
+            return
 
         stream = session['stream']
-
-        # If context available, send it as a text message first
-        if context and context.get('available_products'):
-            ctx_content_name = str(uuid.uuid4())
-            products_list = []
-            for p in context['available_products'][:15]:
-                products_list.append(f"- {p.get('name')} ({p.get('brand')}) - ₹{p.get('price')}")
-
-            context_text = (
-                "AVAILABLE PRODUCTS:\n" +
-                "\n".join(products_list) +
-                "\n\nCURRENT CART:\n" +
-                json.dumps(session.get('cart', []), indent=2)
-            )
-
-            # Send context as text message
-            await self._send_event(stream, json.dumps({
-                "event": {
-                    "contentStart": {
-                        "promptName": session['prompt_name'],
-                        "contentName": ctx_content_name,
-                        "type": "TEXT",
-                        "interactive": False,
-                        "role": "USER",
-                        "textInputConfiguration": {"mediaType": "text/plain"}
-                    }
-                }
-            }))
-            await self._send_event(stream, json.dumps({
-                "event": {
-                    "textInput": {
-                        "promptName": session['prompt_name'],
-                        "contentName": ctx_content_name,
-                        "content": context_text
-                    }
-                }
-            }))
-            await self._send_event(stream, json.dumps({
-                "event": {
-                    "contentEnd": {
-                        "promptName": session['prompt_name'],
-                        "contentName": ctx_content_name
-                    }
-                }
-            }))
-
-        # Start audio input
-        await self.start_audio_input(session_id)
-
-        # Send audio chunk
-        await self.send_audio_chunk(session_id, audio_input)
-
-        # End audio input
-        await self.end_audio_input(session_id)
-
-        # Process response events
         role = None
         display_assistant_text = False
 
         try:
-            while True:
+            while session.get('is_active', False):
                 try:
                     output = await asyncio.wait_for(
-                        stream.await_output(), timeout=15.0
+                        stream.await_output(), timeout=30.0
                     )
                     result = await output[1].receive()
 
@@ -357,7 +350,6 @@ class NovaSonicService:
 
                             if 'contentStart' in event:
                                 role = event['contentStart'].get('role')
-                                # Check for speculative content
                                 if 'additionalModelFields' in event['contentStart']:
                                     additional = json.loads(
                                         event['contentStart']['additionalModelFields']
@@ -371,7 +363,6 @@ class NovaSonicService:
                             elif 'textOutput' in event:
                                 text = event['textOutput'].get('content', '')
                                 if role == 'USER':
-                                    # User transcription (ASR)
                                     yield {
                                         'type': 'transcript',
                                         'text': text,
@@ -379,7 +370,6 @@ class NovaSonicService:
                                     }
                                     logger.info(f"📝 User: {text}")
                                 elif role == 'ASSISTANT' and display_assistant_text:
-                                    # AI response text
                                     yield {
                                         'type': 'transcript',
                                         'text': text,
@@ -390,7 +380,6 @@ class NovaSonicService:
                             elif 'audioOutput' in event:
                                 audio_content = event['audioOutput'].get('content', '')
                                 audio_bytes = base64.b64decode(audio_content)
-                                # Send audio response
                                 yield {
                                     'type': 'audio_output',
                                     'data': audio_bytes
@@ -398,16 +387,16 @@ class NovaSonicService:
                                 logger.info(f"🔊 Audio output: {len(audio_bytes)} bytes")
 
                             elif 'completionEnd' in event:
-                                # Response complete
-                                break
+                                logger.info("Completion ended")
 
                 except asyncio.TimeoutError:
-                    logger.info("Response timeout — no more events")
-                    break
+                    # No events for 30s — keep waiting (stream is still open)
+                    continue
 
+        except asyncio.CancelledError:
+            logger.info(f"Response processor cancelled for session {session_id}")
         except Exception as e:
-            logger.error(f"Error in stream_conversation: {str(e)}")
-            raise
+            logger.error(f"Error in receive_responses: {str(e)}")
 
     async def close_session(self, session_id: str):
         """Close a voice session and clean up the stream."""
@@ -440,3 +429,4 @@ class NovaSonicService:
 
         del self.sessions[session_id]
         logger.info(f"Closed session {session_id}")
+

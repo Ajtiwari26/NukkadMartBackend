@@ -59,9 +59,13 @@ class RedisClient:
             return None
 
         try:
-            # Upstash REST API format: POST with command as path or body
-            command = "/".join(str(arg) for arg in args)
-            response = await cls._http_client.get(f"/{command}")
+            # Use POST with JSON body for all commands to avoid URL length limits
+            # Upstash REST API accepts: POST / with body ["COMMAND", "arg1", "arg2", ...]
+            command_list = [str(arg) for arg in args]
+            response = await cls._http_client.post(
+                "/",
+                json=command_list
+            )
             response.raise_for_status()
             data = response.json()
             return data.get("result")
