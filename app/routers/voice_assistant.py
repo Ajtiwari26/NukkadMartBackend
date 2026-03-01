@@ -92,8 +92,13 @@ def parse_cart_action_from_transcript(text: str, products: list) -> dict | None:
 async def generate_sarvam_tts(text: str) -> bytes | None:
     """Generate high-quality Hindi TTS using Sarvam AI API"""
     url = "https://api.sarvam.ai/text-to-speech"
+    api_key = os.getenv("SARVAM_API_KEY")
+    if not api_key:
+        logger.error("SARVAM_API_KEY environment variable is missing")
+        return None
+
     headers = {
-        "api-subscription-key": "sk_31vozdrd_a1QWSWZ8RhJ4MIRC2wTvOxrU",
+        "api-subscription-key": api_key,
         "Content-Type": "application/json"
     }
     payload = {
