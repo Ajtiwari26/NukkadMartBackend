@@ -7,6 +7,7 @@ import re
 import logging
 import httpx
 import base64
+import os
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
