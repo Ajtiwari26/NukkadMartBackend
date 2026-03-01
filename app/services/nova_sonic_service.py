@@ -384,7 +384,6 @@ class NovaSonicService:
                                     'type': 'audio_output',
                                     'data': audio_bytes
                                 }
-                                logger.info(f"🔊 Audio output: {len(audio_bytes)} bytes")
 
                             elif 'completionEnd' in event:
                                 logger.info("Completion ended")

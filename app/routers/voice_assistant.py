@@ -5,6 +5,8 @@ import json
 import asyncio
 import re
 import logging
+import httpx
+import base64
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -87,6 +89,39 @@ def parse_cart_action_from_transcript(text: str, products: list) -> dict | None:
     return None
 
 
+async def generate_sarvam_tts(text: str) -> bytes | None:
+    """Generate high-quality Hindi TTS using Sarvam AI API"""
+    url = "https://api.sarvam.ai/text-to-speech"
+    headers = {
+        "api-subscription-key": "sk_31vozdrd_a1QWSWZ8RhJ4MIRC2wTvOxrU",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "inputs": [text],
+        "target_language_code": "hi-IN",
+        "speaker": "shubh",
+        "pace": 1.05,
+        "speech_sample_rate": 24000,
+        "enable_preprocessing": True,
+        "model": "bulbul:v3"
+    }
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, json=payload, headers=headers, timeout=10.0)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('audios') and len(data['audios']) > 0:
+                    wav_data = base64.b64decode(data['audios'][0])
+                    # Return the full base64 decoded WAV data directly
+                    return wav_data
+            else:
+                logger.error(f"Sarvam API error: {response.text}")
+        except Exception as e:
+            logger.error(f"Sarvam TTS error: {e}")
+            
+    return None
+
 @router.websocket("/ws/voice/customer/{user_id}")
 async def customer_voice_assistant(
     websocket: WebSocket,
@@ -154,6 +189,14 @@ async def customer_voice_assistant(
             logger.info(f"Context sent to Nova Sonic ({len(context_products)} products for cart matching)")
     except Exception as e:
         logger.error(f"Error sending context to Nova Sonic: {e}")
+        
+    # Send initial welcome message TTS
+    try:
+        welcome_pcm = await generate_sarvam_tts("Namaste! Bataiye aapko kya chahiye?")
+        if welcome_pcm:
+            await websocket.send_bytes(welcome_pcm)
+    except Exception as e:
+        logger.error(f"Error sending welcome TTS: {e}")
     
     # Background response processing
     response_queue = asyncio.Queue()
@@ -177,7 +220,8 @@ async def customer_voice_assistant(
                     break
                     
                 if response['type'] == 'audio_output':
-                    await websocket.send_bytes(response['data'])
+                    # Drop Nova Sonic's robotic audio chunks
+                    pass
                 elif response['type'] == 'transcript':
                     # Forward transcript
                     await websocket.send_text(json.dumps({
@@ -186,35 +230,42 @@ async def customer_voice_assistant(
                         'is_user': response.get('is_user', False)
                     }))
                     
-                    # Check AI transcripts for cart add/remove actions
-                    if not response.get('is_user', False) and context_products:
-                        cart_action = parse_cart_action_from_transcript(
-                            response['text'], context_products
-                        )
-                        if cart_action:
-                            product = cart_action['product']
-                            store_id = product.get('store_id', '')
+                    if not response.get('is_user', False):
+                        # 1. Generate and send high-quality Sarvam TTS audio
+                        pcm_audio = await generate_sarvam_tts(response['text'])
+                        if pcm_audio:
+                            # Send the full audio chunk down to Flutter
+                            await websocket.send_bytes(pcm_audio)
                             
-                            # Send cart_update to Flutter
-                            await websocket.send_text(json.dumps({
-                                'event': 'cart_update',
-                                'action': 'add',
-                                'store_id': store_id,
-                                'quantity': cart_action['quantity'],
-                                'product': {
-                                    'product_id': product.get('id', product.get('product_id', '')),
+                        # 2. Check AI transcripts for cart add/remove actions
+                        if context_products:
+                            cart_action = parse_cart_action_from_transcript(
+                                response['text'], context_products
+                            )
+                            if cart_action:
+                                product = cart_action['product']
+                                store_id = product.get('store_id', '')
+                                
+                                # Send cart_update to Flutter
+                                await websocket.send_text(json.dumps({
+                                    'event': 'cart_update',
+                                    'action': 'add',
                                     'store_id': store_id,
-                                    'name': product.get('name', ''),
-                                    'category': product.get('category', 'General'),
-                                    'brand': product.get('brand'),
-                                    'price': product.get('price', 0),
-                                    'unit': product.get('weight', product.get('unit')),
-                                    'stock_quantity': product.get('stock', 0),
-                                    'image_url': product.get('image_url'),
-                                    'tags': product.get('tags', []),
-                                }
-                            }))
-                            logger.info(f"🛒 Sent cart_update: {cart_action['quantity']}x {product['name']}")
+                                    'quantity': cart_action['quantity'],
+                                    'product': {
+                                        'product_id': product.get('id', product.get('product_id', '')),
+                                        'store_id': store_id,
+                                        'name': product.get('name', ''),
+                                        'category': product.get('category', 'General'),
+                                        'brand': product.get('brand'),
+                                        'price': product.get('price', 0),
+                                        'unit': product.get('weight', product.get('unit')),
+                                        'stock_quantity': product.get('stock', 0),
+                                        'image_url': product.get('image_url'),
+                                        'tags': product.get('tags', []),
+                                    }
+                                }))
+                                logger.info(f"🛒 Sent cart_update: {cart_action['quantity']}x {product['name']}")
         except Exception as e:
             logger.error(f"Response forwarding error: {e}")
     
@@ -318,13 +369,20 @@ async def store_voice_assistant(websocket: WebSocket, store_id: str):
                 if response is None:
                     break
                 if response['type'] == 'audio_output':
-                    await websocket.send_bytes(response['data'])
+                    # Drop Nova Sonic's robotic audio chunks
+                    pass
                 elif response['type'] in ('transcript', 'transcription'):
                     await websocket.send_text(json.dumps({
                         'event': 'transcript',
                         'text': response['text'],
                         'is_user': response.get('is_user', False)
                     }))
+                    
+                    if not response.get('is_user', False):
+                        # Generate and send high-quality Sarvam TTS audio
+                        pcm_audio = await generate_sarvam_tts(response['text'])
+                        if pcm_audio:
+                            await websocket.send_bytes(pcm_audio)
         except Exception as e:
             logger.error(f"Response forwarding error: {e}")
     
