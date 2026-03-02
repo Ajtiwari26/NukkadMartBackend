@@ -20,6 +20,9 @@ class VoiceContextService:
     Pre-loads nearby stores, inventory, and user data when session starts
     """
     
+    # Small shop bypass threshold
+    SMALL_SHOP_THRESHOLD = 20  # If shop has ≤20 items, send all products
+    
     def __init__(self):
         self.redis = RedisClient
         self.db = None  # Will be initialized on first use
@@ -70,12 +73,14 @@ class VoiceContextService:
             store_products = await self._load_store_inventory(store['id'])
             all_products.extend(store_products)
         
-        # 3. Deduplicate and enrich products
+        # 3. Deduplicate and optimize products (small shop bypass + time-based curation)
         unique_products = self._deduplicate_products(all_products)
-        context["available_products"] = unique_products
-        logger.info(f"Loaded {len(unique_products)} unique products")
+        optimized_products = self._get_optimized_products(unique_products)
+        context["available_products"] = optimized_products
+        context["total_products"] = len(unique_products)  # Track total before optimization
+        logger.info(f"Loaded {len(unique_products)} unique products, optimized to {len(optimized_products)}")
         
-        # 4. Build search indexes for fast lookup
+        # 4. Build search indexes for fast lookup (use ALL products, not just optimized)
         context["product_index"] = self._build_product_index(unique_products)
         context["brand_index"] = self._build_brand_index(unique_products)
         context["category_index"] = self._build_category_index(unique_products)
@@ -398,12 +403,21 @@ class VoiceContextService:
         return result
     
     async def _load_store_inventory(self, store_id: str) -> List[Dict]:
-        """Load all products from a store"""
+        """Load all products from a store and cache item count"""
         db = await self._get_db()
+        
+        # Check if item count is cached
+        cached_count = await self.redis.get(f"shop:{store_id}:item_count")
+        
         products = await db.products.find({
             "store_id": store_id,
             "is_active": True
         }).to_list(length=1000)
+        
+        # Cache item count for 1 hour (for small shop bypass logic)
+        if not cached_count or int(cached_count) != len(products):
+            await self.redis.setex(f"shop:{store_id}:item_count", 3600, len(products))
+            logger.info(f"Cached item count for store {store_id}: {len(products)} items")
         
         enriched_products = []
         for p in products:
@@ -412,6 +426,7 @@ class VoiceContextService:
             
             enriched_products.append({
                 "id": str(p['_id']),
+                "_id": str(p['_id']),  # Add both for compatibility
                 "store_id": store_id,
                 "name": p['name'],
                 "brand": p.get('brand', 'Local'),
@@ -447,6 +462,71 @@ class VoiceContextService:
                     unique[key] = product
         
         return list(unique.values())
+    
+    def _get_optimized_products(self, all_products: List[Dict], store_id: str = None) -> List[Dict]:
+        """
+        Optimize product selection based on shop size and time of day.
+        Small shops (≤20 items): Send ALL products
+        Large shops: Send top 100 with time-based prioritization
+        """
+        total_count = len(all_products)
+        
+        # Small shop bypass: send everything
+        if total_count <= self.SMALL_SHOP_THRESHOLD:
+            logger.info(f"Small shop detected ({total_count} items) - sending all products")
+            return all_products
+        
+        # Large shop: apply time-based curation + popularity
+        logger.info(f"Large shop detected ({total_count} items) - applying smart curation")
+        return self._get_time_based_products(all_products)
+    
+    def _get_time_based_products(self, all_products: List[Dict]) -> List[Dict]:
+        """
+        Curate products based on time of day for better recommendations.
+        Morning: Dairy, Breakfast, Beverages
+        Evening: Snacks, Beverages, Ready-to-eat
+        Night: Snacks, Instant food
+        """
+        from datetime import datetime
+        
+        hour = datetime.now().hour
+        
+        # Define priority categories by time
+        if 6 <= hour < 11:  # Morning (6 AM - 11 AM)
+            priority_categories = ['Dairy', 'Breakfast', 'Beverages', 'Bread & Bakery']
+            logger.info(f"Morning time ({hour}:00) - prioritizing breakfast items")
+        elif 11 <= hour < 17:  # Afternoon (11 AM - 5 PM)
+            priority_categories = ['Lunch', 'Beverages', 'Snacks', 'Dairy']
+            logger.info(f"Afternoon time ({hour}:00) - prioritizing lunch items")
+        elif 17 <= hour < 22:  # Evening (5 PM - 10 PM)
+            priority_categories = ['Snacks', 'Beverages', 'Ready-to-eat', 'Party Items']
+            logger.info(f"Evening time ({hour}:00) - prioritizing snacks and party items")
+        else:  # Night (10 PM - 6 AM)
+            priority_categories = ['Snacks', 'Instant Food', 'Beverages']
+            logger.info(f"Night time ({hour}:00) - prioritizing instant food")
+        
+        # Separate products into priority and others
+        prioritized = []
+        others = []
+        
+        for p in all_products:
+            category = p.get('category', '')
+            if category in priority_categories:
+                prioritized.append(p)
+            else:
+                others.append(p)
+        
+        # Sort prioritized by stock (higher stock first)
+        prioritized.sort(key=lambda x: x.get('stock', 0), reverse=True)
+        
+        # Sort others by price (popular items are usually mid-priced)
+        others.sort(key=lambda x: x.get('price', 0))
+        
+        # Return top 50 priority + top 50 others = 100 total
+        result = prioritized[:50] + others[:50]
+        logger.info(f"Curated {len(result)} products: {len(prioritized[:50])} priority, {len(others[:50])} others")
+        
+        return result
     
     def _build_product_index(self, products: List[Dict]) -> Dict[str, List[str]]:
         """Build search index by product name keywords"""

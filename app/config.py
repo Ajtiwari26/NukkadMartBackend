@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     ENABLE_VOICE_ASSISTANT: bool = True
     VOICE_LANGUAGE: str = "hi-IN"
     VOICE_ENABLE_CODE_SWITCHING: bool = True
+    SARVAM_API_KEY: Optional[str] = None
 
     # S3 Configuration
     S3_BUCKET_NAME: str = "nukkadmart-images"

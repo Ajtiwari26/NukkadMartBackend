@@ -133,7 +133,6 @@ async def customer_voice_assistant(
         """SYNCHRONOUS: Wait for Groq before forwarding AI response"""
         try:
             user_transcript_buffer = None
-            pending_action = None  # Store pending action waiting for confirmation
             
             while True:
                 response = await response_queue.get()
@@ -168,94 +167,99 @@ async def customer_voice_assistant(
                             
                             if user_intent:
                                 action = user_intent['action']
-                                product_name = user_intent['product_name']
-                                brand = user_intent['brand']
+                                product = user_intent['product']
                                 quantity = user_intent['quantity']
-                                matched_products = user_intent['matched_products']
+                                prod_id = str(product.get('id', product.get('_id', '')))
+                                store_id = product.get('store_id', '')
                                 
-                                # Build JSON context for Nova Sonic
-                                context_json = {
-                                    "action": action,
-                                    "product_name": product_name,
-                                    "brand": brand,
-                                    "quantity": quantity,
-                                    "options": []
-                                }
-                                
-                                # Add product options
-                                for prod in matched_products[:5]:  # Max 5 options
-                                    prod_id = str(prod.get('id', prod.get('_id', '')))
-                                    context_json["options"].append({
-                                        "product_id": prod_id,
-                                        "name": prod.get('name'),
-                                        "brand": prod.get('brand'),
-                                        "price": prod.get('price', 0),
-                                        "unit": prod.get('weight', prod.get('unit')),
-                                        "in_cart": session_cart.get(prod_id, 0)
-                                    })
-                                
-                                # Store pending action for execution after confirmation
-                                if action in ['add', 'update', 'remove'] and len(matched_products) == 1:
-                                    pending_action = {
-                                        'action': action,
-                                        'product': matched_products[0],
-                                        'quantity': quantity if quantity else 1.0
-                                    }
-                                
-                                # Inject JSON to Nova Sonic (Sonic decides what to do)
-                                instruction = f"USER_INTENT: {json.dumps(context_json, ensure_ascii=False)}"
-                                await nova_sonic.inject_instruction(session_id, instruction)
-                                
-                                logger.info(f"🧠 → Sonic: {action.upper()} {product_name} ({len(matched_products)} options)")
+                                # Build instruction for Nova Sonic
+                                if action == 'query':
+                                    # Query: Tell Sonic to ask for confirmation
+                                    instruction = f"USER_QUERY: User asked about {product['name']}. Tell price and ask 'Add kar dun?'"
+                                    await nova_sonic.inject_instruction(session_id, instruction)
+                                    logger.info(f"🔍 Query: {product['name']}")
+                                    
+                                elif action == 'add':
+                                    # Add: Execute + tell Sonic to confirm
+                                    session_cart[prod_id] = session_cart.get(prod_id, 0) + quantity
+                                    instruction = f"CART_DONE: Added {quantity}x {product['name']} to cart. Confirm with 'Ji sir, {product['name']} add kar diya'"
+                                    await nova_sonic.inject_instruction(session_id, instruction)
+                                    
+                                    # Send to Flutter
+                                    await websocket.send_text(json.dumps({
+                                        'event': 'cart_update',
+                                        'action': 'add',
+                                        'store_id': store_id,
+                                        'quantity': quantity,
+                                        'product': {
+                                            'product_id': prod_id,
+                                            'store_id': store_id,
+                                            'name': product['name'],
+                                            'category': product.get('category', 'General'),
+                                            'brand': product.get('brand'),
+                                            'price': product.get('price', 0),
+                                            'unit': product.get('weight', product.get('unit')),
+                                            'stock_quantity': product.get('stock', 0),
+                                            'image_url': product.get('image_url'),
+                                            'tags': product.get('tags', []),
+                                        }
+                                    }))
+                                    logger.info(f"✅ Added: {quantity}x {product['name']}")
+                                    
+                                elif action == 'update':
+                                    # Update: Execute + tell Sonic to confirm
+                                    session_cart[prod_id] = quantity
+                                    instruction = f"CART_DONE: Updated {product['name']} quantity to {quantity}. Confirm with 'Ji sir, quantity {quantity} kar di'"
+                                    await nova_sonic.inject_instruction(session_id, instruction)
+                                    
+                                    await websocket.send_text(json.dumps({
+                                        'event': 'cart_update',
+                                        'action': 'update',
+                                        'store_id': store_id,
+                                        'quantity': quantity,
+                                        'product': {
+                                            'product_id': prod_id,
+                                            'store_id': store_id,
+                                            'name': product['name'],
+                                            'category': product.get('category', 'General'),
+                                            'brand': product.get('brand'),
+                                            'price': product.get('price', 0),
+                                            'unit': product.get('weight', product.get('unit')),
+                                            'stock_quantity': product.get('stock', 0),
+                                            'image_url': product.get('image_url'),
+                                            'tags': product.get('tags', []),
+                                        }
+                                    }))
+                                    logger.info(f"🔄 Updated: {product['name']} → {quantity}")
+                                    
+                                elif action == 'remove':
+                                    # Remove: Execute + tell Sonic to confirm
+                                    session_cart.pop(prod_id, None)
+                                    instruction = f"CART_DONE: Removed {product['name']} from cart. Confirm with 'Ji sir, {product['name']} hata diya'"
+                                    await nova_sonic.inject_instruction(session_id, instruction)
+                                    
+                                    await websocket.send_text(json.dumps({
+                                        'event': 'cart_update',
+                                        'action': 'remove',
+                                        'store_id': store_id,
+                                        'quantity': 1,
+                                        'product': {
+                                            'product_id': prod_id,
+                                            'store_id': store_id,
+                                            'name': product['name'],
+                                            'category': product.get('category', 'General'),
+                                            'brand': product.get('brand'),
+                                            'price': product.get('price', 0),
+                                            'unit': product.get('weight', product.get('unit')),
+                                            'stock_quantity': product.get('stock', 0),
+                                            'image_url': product.get('image_url'),
+                                            'tags': product.get('tags', []),
+                                        }
+                                    }))
+                                    logger.info(f"🗑️ Removed: {product['name']}")
                     
                     else:
-                        # AI spoke - check if it's confirming an action
-                        ai_text_lower = text.lower()
-                        
-                        # Detect confirmation phrases
-                        confirmation_phrases = ['add kar diya', 'hata diya', 'kar di', 'quantity']
-                        is_confirmation = any(phrase in ai_text_lower for phrase in confirmation_phrases)
-                        
-                        # Execute pending action if AI confirmed
-                        if is_confirmation and pending_action:
-                            action = pending_action['action']
-                            product = pending_action['product']
-                            quantity = pending_action['quantity']
-                            prod_id = str(product.get('id', product.get('_id', '')))
-                            store_id = product.get('store_id', '')
-                            
-                            # Update cart
-                            if action == 'add':
-                                session_cart[prod_id] = session_cart.get(prod_id, 0) + quantity
-                            elif action == 'update':
-                                session_cart[prod_id] = quantity
-                            elif action == 'remove':
-                                session_cart.pop(prod_id, None)
-                            
-                            # Send to Flutter
-                            await websocket.send_text(json.dumps({
-                                'event': 'cart_update',
-                                'action': action,
-                                'store_id': store_id,
-                                'quantity': quantity,
-                                'product': {
-                                    'product_id': prod_id,
-                                    'store_id': store_id,
-                                    'name': product['name'],
-                                    'category': product.get('category', 'General'),
-                                    'brand': product.get('brand'),
-                                    'price': product.get('price', 0),
-                                    'unit': product.get('weight', product.get('unit')),
-                                    'stock_quantity': product.get('stock', 0),
-                                    'image_url': product.get('image_url'),
-                                    'tags': product.get('tags', []),
-                                }
-                            }))
-                            
-                            logger.info(f"✅ Executed: {action.upper()} {quantity}x {product['name']}")
-                            pending_action = None  # Clear pending action
-                        
-                        # Forward transcript + generate TTS
+                        # AI spoke - forward transcript + generate TTS
                         await websocket.send_text(json.dumps({
                             'event': 'transcript',
                             'text': text,

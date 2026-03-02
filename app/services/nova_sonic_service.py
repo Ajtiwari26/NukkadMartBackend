@@ -80,16 +80,31 @@ class NovaSonicService:
         # Build system prompt based on persona
         if persona == "helpful_shopkeeper":
             system_prompt = (
-                "You are a professional shopkeeper in India. Always reply in Hindi "
-                "but use English for brand names.\n\n"
-                "GREETING: \"Namaste sir, aapko kya chahiye? Main aapki help kar sakta hun.\"\n\n"
+                "You are a professional shopkeeper in India. Reply in Hindi with English brand names.\n\n"
                 "RULES:\n"
-                "- Use \"Sir/Madam\" and \"ji\" (not Mummy/Beta)\n"
-                "- Speak primarily in Hindi with natural English words (Hinglish)\n"
-                "- Be helpful and professional\n"
-                "- Keep responses SHORT (1-2 sentences max)\n"
-                "- When customer asks for items, check inventory and add to cart\n"
-                "- Suggest alternatives if item not available"
+                "- Use \"Sir/Madam\" and \"ji\"\n"
+                "- Keep responses SHORT (1-2 sentences)\n"
+                "- NEVER mention stock quantity\n\n"
+                "USER_INTENT JSON FORMAT:\n"
+                "You will receive: {action, product_name, brand, quantity, options: [{product_id, name, brand, price, unit, in_cart}]}\n\n"
+                "HANDLING LOGIC:\n"
+                "1. QUERY (user asking):\n"
+                "   - If 1 option: Tell price, ask 'Add kar dun?'\n"
+                "   - If multiple options: List all with prices, ask which one\n"
+                "   - Example: 'Sir, Toned Milk ₹27 aur Full Cream Milk ₹33 hai. Kaunsa chahiye?'\n\n"
+                "2. ADD (user wants to add):\n"
+                "   - If 1 option: Confirm 'Ji sir, [name] add kar diya'\n"
+                "   - If multiple options: Ask which brand/variant\n\n"
+                "3. UPDATE (change quantity in cart):\n"
+                "   - If 1 option in cart: Confirm 'Ji sir, quantity [X] kar di'\n"
+                "   - If multiple in cart: Ask which one to update\n\n"
+                "4. REMOVE (delete from cart):\n"
+                "   - If 1 option in cart: Confirm 'Ji sir, [name] hata diya'\n"
+                "   - If multiple in cart: Ask which one to remove\n\n"
+                "IMPORTANT:\n"
+                "- You ONLY respond, you DON'T execute cart actions\n"
+                "- Cart actions are handled by the system automatically\n"
+                "- Just guide the user naturally"
             )
         else:
             system_prompt = (
@@ -251,6 +266,52 @@ class NovaSonicService:
             }
         }))
         logger.info(f"Sent context ({len(products)} products) to Nova Sonic session {session_id}")
+
+    async def inject_instruction(self, session_id: str, instruction: str):
+        """
+        Inject a USER instruction into Nova Sonic (e.g., cart action from Groq)
+        Uses USER role to avoid "Duplicate SYSTEM content" error
+        """
+        session = self.sessions.get(session_id)
+        if not session:
+            return
+
+        stream = session['stream']
+        instruction_content_name = str(uuid.uuid4())
+
+        # contentStart (TEXT, USER) - Changed from SYSTEM to USER
+        await self._send_event(stream, json.dumps({
+            "event": {
+                "contentStart": {
+                    "promptName": session['prompt_name'],
+                    "contentName": instruction_content_name,
+                    "type": "TEXT",
+                    "interactive": False,
+                    "role": "USER",
+                    "textInputConfiguration": {"mediaType": "text/plain"}
+                }
+            }
+        }))
+        # textInput
+        await self._send_event(stream, json.dumps({
+            "event": {
+                "textInput": {
+                    "promptName": session['prompt_name'],
+                    "contentName": instruction_content_name,
+                    "content": instruction
+                }
+            }
+        }))
+        # contentEnd
+        await self._send_event(stream, json.dumps({
+            "event": {
+                "contentEnd": {
+                    "promptName": session['prompt_name'],
+                    "contentName": instruction_content_name
+                }
+            }
+        }))
+        logger.info(f"💉 Injected instruction: {instruction}")
 
     async def start_audio_input(self, session_id: str):
         """Start a new audio input content stream (generates unique content name each time)."""
