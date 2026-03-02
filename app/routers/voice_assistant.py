@@ -194,14 +194,40 @@ async def customer_voice_assistant(
                                         "in_cart": session_cart.get(prod_id, 0)
                                     })
                                 
-                                # Store pending action for execution after confirmation
-                                if action in ['add', 'update', 'remove']:
+                                # Handle pending action logic
+                                if pending_action and pending_action.get('awaiting_selection'):
+                                    # User is clarifying which product - keep original action
+                                    # Find the selected product from matched_products
+                                    selected_product = None
+                                    for prod in matched_products:
+                                        # Check if this product matches the clarification
+                                        prod_name_lower = prod.get('name', '').lower()
+                                        if brand and brand.lower() in prod_name_lower:
+                                            selected_product = prod
+                                            break
+                                        elif product_name.lower() in prod_name_lower:
+                                            selected_product = prod
+                                            break
+                                    
+                                    if selected_product:
+                                        # Update pending action with selected product
+                                        pending_action = {
+                                            'action': pending_action['action'],  # Keep original action (add/update/remove)
+                                            'product': selected_product,
+                                            'quantity': pending_action['quantity'],
+                                            'awaiting_selection': False  # Selection complete
+                                        }
+                                        logger.info(f"🎯 User clarified: {selected_product['name']}")
+                                
+                                # Store NEW pending action only if not clarifying
+                                elif action in ['add', 'update', 'remove']:
                                     if len(matched_products) == 1:
                                         # Single product - store for immediate execution
                                         pending_action = {
                                             'action': action,
                                             'product': matched_products[0],
-                                            'quantity': quantity if quantity else 1.0
+                                            'quantity': quantity if quantity else 1.0,
+                                            'awaiting_selection': False
                                         }
                                     else:
                                         # Multiple products - store all options, will select after user clarifies
@@ -222,71 +248,53 @@ async def customer_voice_assistant(
                         # AI spoke - check if it's confirming an action
                         ai_text_lower = text.lower()
                         
-                        # Detect confirmation phrases
-                        confirmation_phrases = ['add kar diya', 'hata diya', 'kar di', 'quantity']
+                        # Detect confirmation phrases (AI confirming it executed the action)
+                        confirmation_phrases = [
+                            'add kar diya', 'add kar di', 'daal diya', 
+                            'hata diya', 'remove kar diya', 'nikaal diya',
+                            'quantity badal di', 'update kar diya'
+                        ]
                         is_confirmation = any(phrase in ai_text_lower for phrase in confirmation_phrases)
                         
                         # Execute pending action if AI confirmed
-                        if is_confirmation and pending_action:
-                            # Check if awaiting product selection
-                            if pending_action.get('awaiting_selection'):
-                                # User clarified which product - find it from the last user input
-                                selected_product = None
-                                for prod in pending_action['products']:
-                                    prod_name_lower = prod.get('name', '').lower()
-                                    # Check if product name mentioned in AI response
-                                    if any(word in ai_text_lower for word in prod_name_lower.split()):
-                                        selected_product = prod
-                                        break
-                                
-                                if selected_product:
-                                    action = pending_action['action']
-                                    product = selected_product
-                                    quantity = pending_action['quantity']
-                                else:
-                                    # Couldn't determine product, clear pending
-                                    pending_action = None
-                                    logger.warning("⚠️ Couldn't determine selected product")
-                            else:
-                                # Single product case
-                                action = pending_action['action']
-                                product = pending_action['product']
-                                quantity = pending_action['quantity']
+                        if is_confirmation and pending_action and not pending_action.get('awaiting_selection'):
+                            action = pending_action['action']
+                            product = pending_action['product']
+                            quantity = pending_action['quantity']
                             
-                            if pending_action and not pending_action.get('awaiting_selection'):
-                                prod_id = str(product.get('id', product.get('_id', '')))
-                                store_id = product.get('store_id', '')
-                                
-                                # Update cart
-                                if action == 'add':
-                                    session_cart[prod_id] = session_cart.get(prod_id, 0) + quantity
-                                elif action == 'update':
-                                    session_cart[prod_id] = quantity
-                                elif action == 'remove':
-                                    session_cart.pop(prod_id, None)
-                                
-                                # Send to Flutter
-                                await websocket.send_text(json.dumps({
-                                    'event': 'cart_update',
-                                    'action': action,
+                            prod_id = str(product.get('id', product.get('_id', '')))
+                            store_id = product.get('store_id', '')
+                            
+                            # Update cart
+                            if action == 'add':
+                                session_cart[prod_id] = session_cart.get(prod_id, 0) + quantity
+                            elif action == 'update':
+                                session_cart[prod_id] = quantity
+                            elif action == 'remove':
+                                session_cart.pop(prod_id, None)
+                            
+                            # Send to Flutter
+                            await websocket.send_text(json.dumps({
+                                'event': 'cart_update',
+                                'action': action,
+                                'store_id': store_id,
+                                'quantity': quantity,
+                                'product': {
+                                    'product_id': prod_id,
                                     'store_id': store_id,
-                                    'quantity': quantity,
-                                    'product': {
-                                        'product_id': prod_id,
-                                        'store_id': store_id,
-                                        'name': product['name'],
-                                        'category': product.get('category', 'General'),
-                                        'brand': product.get('brand'),
-                                        'price': product.get('price', 0),
-                                        'unit': product.get('weight', product.get('unit')),
-                                        'stock_quantity': product.get('stock', 0),
-                                        'image_url': product.get('image_url'),
-                                        'tags': product.get('tags', []),
-                                    }
-                                }))
-                                
-                                logger.info(f"✅ Executed: {action.upper()} {quantity}x {product['name']}")
-                                pending_action = None  # Clear pending action
+                                    'name': product['name'],
+                                    'category': product.get('category', 'General'),
+                                    'brand': product.get('brand'),
+                                    'price': product.get('price', 0),
+                                    'unit': product.get('weight', product.get('unit')),
+                                    'stock_quantity': product.get('stock', 0),
+                                    'image_url': product.get('image_url'),
+                                    'tags': product.get('tags', []),
+                                }
+                            }))
+                            
+                            logger.info(f"✅ Executed: {action.upper()} {quantity}x {product['name']}")
+                            pending_action = None  # Clear pending action
                         
                         # Forward transcript + generate TTS
                         await websocket.send_text(json.dumps({

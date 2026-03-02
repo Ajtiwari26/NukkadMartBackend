@@ -62,26 +62,34 @@ User Said: "{user_speech}"
 Available Products: {', '.join(product_list)}{cart_context}
 
 ACTIONS:
-- "query": User ASKING about product (uses "chahiye", "kya hai", "batao", OR mentions product without command)
-- "add": User EXPLICITLY wants to ADD (uses "add kar do", "daal do", "le lunga")
+- "query": User ASKING about product (uses "chahiye", "kya hai", "batao", "kitne ka", "price")
+- "add": User wants to ADD to cart (uses "add", "daal do", "le lunga", OR mentions quantity + product)
 - "update": User wants to CHANGE quantity of item IN CART (uses "quantity X kar do", "X aur add")
 - "remove": User wants to REMOVE item (uses "hata do", "remove", "nikaal do")
+
+CRITICAL RULES:
+1. If user mentions QUANTITY + PRODUCT → action is "add" (e.g., "do milk", "teen bread")
+2. If user just mentions PRODUCT without quantity → action is "query" (e.g., "milk", "bread")
+3. If user says "chahiye" without quantity → action is "query"
+4. If user says "chahiye" WITH quantity → action is "add"
 
 EXTRACTION RULES:
 1. product_name: Generic product type (e.g., "milk", "sugar", "bread")
 2. brand: Specific brand if mentioned (e.g., "Amul", "Tata"), else null
-3. quantity: Number mentioned, null if not specified
+3. quantity: Number mentioned (ek=1, do=2, teen=3, etc.), null if not specified
 4. For QUERY: quantity can be null (user just asking about product)
-5. For ADD/UPDATE/REMOVE: quantity defaults to 1 if not specified
+5. For ADD: quantity defaults to 1 if not specified
 
 EXAMPLES:
+- "milk" → {{"action": "query", "product_name": "milk", "brand": null, "quantity": null}}
 - "milk chahiye" → {{"action": "query", "product_name": "milk", "brand": null, "quantity": null}}
-- "Amul milk chahiye" → {{"action": "query", "product_name": "milk", "brand": "Amul", "quantity": null}}
-- "ek kilo sugar" → {{"action": "query", "product_name": "sugar", "brand": null, "quantity": 1}}
-- "teen paneer add kar do" → {{"action": "add", "product_name": "paneer", "brand": null, "quantity": 3}}
-- "Amul paneer add kar do" → {{"action": "add", "product_name": "paneer", "brand": "Amul", "quantity": 1}}
+- "do milk" → {{"action": "add", "product_name": "milk", "brand": null, "quantity": 2}}
+- "do milk packet" → {{"action": "add", "product_name": "milk", "brand": null, "quantity": 2}}
+- "teen bread ke packet" → {{"action": "add", "product_name": "bread", "brand": null, "quantity": 3}}
+- "ek kilo sugar chahiye" → {{"action": "add", "product_name": "sugar", "brand": null, "quantity": 1}}
+- "Amul milk add kar do" → {{"action": "add", "product_name": "milk", "brand": "Amul", "quantity": 1}}
 - "bread hata do" → {{"action": "remove", "product_name": "bread", "brand": null, "quantity": 1}}
-- "cart mein jo do hai usko teen kar do" → {{"action": "update", "product_name": "paneer", "brand": null, "quantity": 3}}
+- "full cream" → {{"action": "query", "product_name": "milk", "brand": "full cream", "quantity": null}}
 
 Output ONLY this JSON (no extra text):
 {{
@@ -172,9 +180,34 @@ Output ONLY this JSON (no extra text):
         
         matches = []
         
+        # If brand specified, try exact brand match first
+        if brand_lower:
+            for product in available_products:
+                prod_name = product.get('name', '').lower()
+                prod_brand = product.get('brand', '').lower()
+                
+                # Check if product name matches
+                name_match = (
+                    product_name_lower in prod_name or 
+                    prod_name in product_name_lower or
+                    any(word in prod_name for word in product_name_lower.split())
+                )
+                
+                if name_match:
+                    # Check brand match (in product name OR brand field)
+                    brand_in_name = brand_lower in prod_name
+                    brand_in_field = brand_lower in prod_brand or prod_brand in brand_lower
+                    
+                    if brand_in_name or brand_in_field:
+                        matches.append(product)
+            
+            # If brand match found, return only those
+            if matches:
+                return matches
+        
+        # No brand specified OR no brand matches found - return all name matches
         for product in available_products:
             prod_name = product.get('name', '').lower()
-            prod_brand = product.get('brand', '').lower()
             
             # Check if product name matches
             name_match = (
@@ -183,13 +216,7 @@ Output ONLY this JSON (no extra text):
                 any(word in prod_name for word in product_name_lower.split())
             )
             
-            if name_match:
-                # If brand specified, check brand match
-                if brand_lower:
-                    if brand_lower in prod_brand or prod_brand in brand_lower:
-                        matches.append(product)
-                else:
-                    # No brand specified, add all matching products
-                    matches.append(product)
+            if name_match and product not in matches:
+                matches.append(product)
         
         return matches
