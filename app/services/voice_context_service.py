@@ -325,6 +325,51 @@ class VoiceContextService:
                 return product
         return None
     
+    async def search_across_demo_stores(self, product_name: str, brand: Optional[str] = None) -> List[Dict]:
+        """Search for a product across all demo stores (TestShop 1, 2, 3)"""
+        db = await self._get_db()
+        demo_store_ids = ['DEMO_STORE_1', 'DEMO_STORE_2', 'DEMO_STORE_3']
+        
+        # Load all stores to get their names
+        stores = await db.stores.find({"store_id": {"$in": demo_store_ids}}).to_list(length=10)
+        store_names = {s['store_id']: s.get('name', s['store_id']) for s in stores}
+        
+        matches = []
+        product_name_lower = product_name.lower()
+        brand_lower = brand.lower() if brand else None
+        
+        for store_id in demo_store_ids:
+            store_name = store_names.get(store_id, store_id)
+            products = await self._load_store_inventory(store_id)
+            
+            for product in products:
+                prod_name = product.get('name', '').lower()
+                prod_brand = product.get('brand', '').lower()
+                
+                # Check if product name matches
+                name_match = (
+                    product_name_lower in prod_name or 
+                    prod_name in product_name_lower or
+                    any(word in prod_name for word in product_name_lower.split())
+                )
+                
+                if name_match:
+                    if brand_lower:
+                        brand_in_name = brand_lower in prod_name
+                        brand_in_field = brand_lower in prod_brand or prod_brand in brand_lower
+                        if not (brand_in_name or brand_in_field):
+                            continue
+                            
+                    product['store_id'] = store_id
+                    product['store_name'] = store_name
+                    matches.append(product)
+                    
+                    # Limit to top 3 matches per store to avoid massive payloads
+                    if len([m for m in matches if m['store_id'] == store_id]) >= 3:
+                        break
+                        
+        return matches
+
     async def update_cart(self, session_id: str, cart_data: Dict) -> bool:
         """Update cart in Redis"""
         key = f"voice_cart:{session_id}"

@@ -275,6 +275,34 @@ async def set_store_password(data: SetPassword):
     return {"success": True, "message": "Password updated successfully"}
 
 
+@router.get("/demo", response_model=List[NearbyStoreResponse])
+async def get_demo_stores():
+    """Get demo stores for hackathon testing — no location needed."""
+    db = await get_database()
+
+    stores = await db.stores.find({"is_demo": True, "status": "ACTIVE"}).to_list(10)
+
+    result = []
+    for store in stores:
+        store_settings = store.get("settings", {})
+        address = store.get("address", {})
+
+        result.append(NearbyStoreResponse(
+            store_id=store["store_id"],
+            name=store["name"],
+            address=f"{address.get('street', '')}, {address.get('city', '')}",
+            distance_km=0.0,  # Demo stores have no real distance
+            rating=store.get("rating"),
+            is_open=True,  # Always open for demo
+            delivery_available=True,
+            min_order_value=store_settings.get("min_order_value", 0),
+            total_products=store.get("total_products", 0),
+            udhaar_enabled=store_settings.get("udhaar_enabled", False),
+        ))
+
+    return result
+
+
 @router.get("/nearby", response_model=List[NearbyStoreResponse])
 async def find_nearby_stores(
     lat: float = Query(..., ge=-90, le=90),

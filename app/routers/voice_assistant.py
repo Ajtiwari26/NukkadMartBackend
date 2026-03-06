@@ -6,15 +6,31 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from app.services.nova_sonic_service import NovaSonicService
 from app.services.voice_context_service import VoiceContextService
 from app.services.intent_classifier import IntentClassifier
+from app.db.redis import RedisClient
 import json
 import asyncio
 import logging
 import httpx
 import base64
 import os
+import re
+from enum import Enum
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _clean_text_for_tts(text: str) -> str:
+    """Clean text for natural TTS — remove punctuation that sounds bad when read aloud."""
+    # Replace ₹ symbol with "rupees" so it's spoken naturally
+    text = text.replace('₹', ' rupees ')
+    # Remove parentheses and brackets but keep the content inside
+    text = re.sub(r'[()\[\]{}]', ' ', text)
+    # Remove commas, full stops, colons, semicolons, exclamation, dashes, asterisks, quotes
+    text = re.sub(r'[,\.;:!\-–—*\"\'\?_]', ' ', text)
+    # Collapse multiple spaces into one
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
 async def generate_sarvam_tts(text: str) -> bytes | None:
@@ -24,12 +40,15 @@ async def generate_sarvam_tts(text: str) -> bytes | None:
     if not api_key:
         return None
 
+    # Clean text for natural speech
+    clean_text = _clean_text_for_tts(text)
+
     headers = {
         "api-subscription-key": api_key,
         "Content-Type": "application/json"
     }
     payload = {
-        "inputs": [text],
+        "inputs": [clean_text],
         "target_language_code": "hi-IN",
         "speaker": "shubh",
         "pace": 1.05,
@@ -50,19 +69,134 @@ async def generate_sarvam_tts(text: str) -> bytes | None:
     return None
 
 
+# Hindi number words for quantity detection
+HINDI_NUMBERS = {
+    'ek': 1, 'do': 2, 'teen': 3, 'char': 4, 'paanch': 5,
+    'chhah': 6, 'saat': 7, 'aath': 8, 'nau': 9, 'das': 10,
+    'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5
+}
+
+# Cancel keywords — recognized in all non-IDLE states
+CANCEL_KEYWORDS = {'cancel', 'chhod do', 'chhodo', 'rehne do', 'nahi chahiye',
+                   'mat karo', 'band karo', 'kuch nahi', 'jaane do', 'ruko',
+                   'rehne de', 'chhod de', 'mat kar'}
+
+
+def _get_prod_id(product: dict) -> str:
+    """Normalize product ID extraction — single source of truth."""
+    return str(product.get('id', product.get('_id', '')))
+
+
+async def _execute_cart_action(
+    action: str, product: dict, quantity: float,
+    websocket: WebSocket, session_cart: dict
+) -> None:
+    """Execute a cart action and send the update to Flutter.
+    Shared by both voice-confirmation and UI-selection paths."""
+    prod_id = _get_prod_id(product)
+    store_id = product.get('store_id', '')
+
+    # Update server-side session cart
+    if action == 'add':
+        session_cart[prod_id] = session_cart.get(prod_id, 0) + quantity
+    elif action == 'update':
+        session_cart[prod_id] = quantity
+    elif action == 'remove':
+        session_cart.pop(prod_id, None)
+
+    # Send cart_update event to Flutter
+    await websocket.send_text(json.dumps({
+        'event': 'cart_update',
+        'action': action,
+        'store_id': store_id,
+        'quantity': quantity,
+        'product': {
+            'product_id': prod_id,
+            'store_id': store_id,
+            'name': product['name'],
+            'category': product.get('category', 'General'),
+            'brand': product.get('brand'),
+            'price': product.get('price', 0),
+            'unit': product.get('weight', product.get('unit')),
+            'stock_quantity': product.get('stock', 0),
+            'image_url': product.get('image_url'),
+            'tags': product.get('tags', []),
+        }
+    }))
+
+    logger.info(f"✅ Executed: {action.upper()} {quantity}x {product['name']}")
+
+class ConversationState(Enum):
+    IDLE = "IDLE"                                     # Waiting for user input
+    AWAITING_STORE_APPROVAL = "AWAITING_STORE_APPROVAL" # Asked permission for cross-store
+    AWAITING_CONFIRM = "AWAITING_CONFIRM"             # Asking to confirm single item
+    AWAITING_SELECTION = "AWAITING_SELECTION"         # Showing UI for multiple varieties
+    AWAITING_CLARIFICATION = "AWAITING_CLARIFICATION" # Asking user to clarify modify vs add more
+
+async def _resolve_products(product_name, brand, context_products, approved_stores, current_store_id, intent_classifier):
+    """
+    Unified product resolution pipeline for all voice actions.
+    Searches current store -> approved stores -> other stores.
+    Returns: (matched_products, source_store_id, needs_approval)
+    """
+    # 1. Search current context (Current Store + Approved Stores already merged)
+    matched_products = intent_classifier._find_matching_products(
+        product_name, brand, context_products
+    )
+    
+    if matched_products:
+        return matched_products, current_store_id, False
+        
+    # 2. If no matches and in demo mode, search OTHER demo stores
+    if not matched_products and current_store_id and current_store_id.startswith('DEMO_STORE_'):
+        logger.info(f"🔍 Item not found in context, searching other demo stores...")
+        other_stores = ['DEMO_STORE_1', 'DEMO_STORE_2', 'DEMO_STORE_3']
+        other_stores.remove(current_store_id)
+        
+        from app.db.mongodb import get_database
+        db = await get_database()
+        
+        for other_store_id in other_stores:
+            other_products = await db.products.find({'store_id': other_store_id}).to_list(length=100)
+            other_matches = intent_classifier._find_matching_products(
+                product_name, brand, other_products
+            )
+            
+            if other_matches:
+                needs_approval = other_store_id not in approved_stores
+                if needs_approval:
+                    logger.info(f"✅ Found {len(other_matches)} matches in {other_store_id} (needs approval)")
+                else:
+                    logger.info(f"✅ Found {len(other_matches)} matches in APPROVED store {other_store_id}")
+                return other_matches, other_store_id, needs_approval
+                
+    return [], current_store_id, False
+
+
 @router.websocket("/ws/voice/customer/{user_id}")
 async def customer_voice_assistant(
     websocket: WebSocket,
     user_id: str,
-    latitude: float = Query(...),
-    longitude: float = Query(...)
+    latitude: float = Query(None),
+    longitude: float = Query(None),
+    store_id: str = Query(None)
 ):
     """
     SYNCHRONOUS voice assistant - NO RACE CONDITIONS
     Flow: User speaks → Groq classifies → Inject to Sonic → Sonic responds
+    
+    For demo mode: Only store_id is required (latitude/longitude optional)
+    For normal mode: latitude/longitude required for nearby store search
     """
     await websocket.accept()
-    logger.info(f"Customer voice session started for user: {user_id} at ({latitude}, {longitude})")
+    
+    # Demo mode: store_id provided, no location needed
+    if store_id and (latitude is None or longitude is None):
+        logger.info(f"Customer voice session started for user: {user_id}, store_id={store_id} (DEMO MODE)")
+        latitude = 0.0  # Dummy coordinates for demo
+        longitude = 0.0
+    else:
+        logger.info(f"Customer voice session started for user: {user_id} at ({latitude}, {longitude}), store_id={store_id}")
     
     nova_sonic = NovaSonicService()
     context_service = VoiceContextService()
@@ -78,23 +212,66 @@ async def customer_voice_assistant(
     session_id = session['id']
     context_products = []
     session_cart = {}
+    current_store_id = store_id  # Capture for use in nested functions
+    
+    # State machine and explicitly typed pending action sharing
+    shared_state = {
+        'state': ConversationState.IDLE,
+        'pending': None,           # Shape: {action, products, quantity, source_store_id, ...}
+        'approved_stores': set(),  # Stores user has approved for cross-store adds
+        'processing': False,       # Lock: True while state machine is processing (suppress AI)
+    }
     
     # Load context
     try:
-        context_summary = await context_service.initialize_customer_context(
-            session_id=session_id,
-            user_id=user_id,
-            latitude=latitude,
-            longitude=longitude,
-            radius_km=10.0
-        )
+        if store_id:
+            # Load inventory for specific store
+            logger.info(f"Loading inventory for specific store: {store_id}")
+            db = await context_service._get_db()
+            
+            # Get store info
+            store_doc = await db.stores.find_one({"store_id": store_id})
+            store_name = store_doc.get('name', store_id) if store_doc else store_id
+            
+            # Get products for this store
+            products = await context_service._load_store_inventory(store_id)
+            
+            # Tag each product with store info
+            for p in products:
+                p['store_id'] = store_id
+                p['store_name'] = store_name
+            
+            # Store in Redis
+            context_data = {
+                'stores': [{'store_id': store_id, 'name': store_name}],
+                'available_products': products,
+                'user_id': user_id,
+                'session_id': session_id
+            }
+            redis = RedisClient()
+            await redis.setex(f"voice_context:{session_id}", 3600, json.dumps(context_data, default=str))
+            
+            context_summary = {
+                'stores_count': 1,
+                'products_count': len(products),
+                'selected_store': store_name
+            }
+            context_products = products
+        else:
+            context_summary = await context_service.initialize_customer_context(
+                session_id=session_id,
+                user_id=user_id,
+                latitude=latitude,
+                longitude=longitude,
+                radius_km=10.0
+            )
         
         await websocket.send_text(json.dumps({
             'event': 'context_loaded',
             'data': context_summary
         }))
         
-        logger.info(f"Context loaded: {context_summary['stores_count']} stores, {context_summary['products_count']} products")
+        logger.info(f"Context loaded: {context_summary.get('stores_count', 0)} stores, {context_summary.get('products_count', 0)} products")
     except Exception as e:
         logger.error(f"Error loading context: {e}")
     
@@ -132,9 +309,6 @@ async def customer_voice_assistant(
     async def forward_responses():
         """SYNCHRONOUS: Wait for Groq before forwarding AI response"""
         try:
-            user_transcript_buffer = None
-            pending_action = None  # Store pending action waiting for confirmation
-            
             while True:
                 response = await response_queue.get()
                 if response is None:
@@ -148,9 +322,6 @@ async def customer_voice_assistant(
                     text = response['text']
                     
                     if is_user:
-                        # USER spoke - classify intent BEFORE Nova Sonic responds
-                        user_transcript_buffer = text
-                        
                         # Forward user transcript immediately
                         await websocket.send_text(json.dumps({
                             'event': 'transcript',
@@ -158,151 +329,650 @@ async def customer_voice_assistant(
                             'is_user': True
                         }))
                         
-                        # Classify intent SYNCHRONOUSLY
-                        if context_products:
+                        if not context_products:
+                            continue
+                        
+                        # Send processing indicator so user sees visual feedback
+                        await websocket.send_text(json.dumps({'event': 'processing'}))
+                        shared_state['processing'] = True  # Suppress AI responses during processing
+                            
+                        # === STATE MACHINE: DECIDE NEXT STATE ===
+                        current_state = shared_state['state']
+                        
+                        if current_state == ConversationState.IDLE:
+                            # 1. Classify New Intent
                             user_intent = await intent_classifier.classify_user_intent(
-                                text,
-                                context_products,
-                                session_cart
+                                text, context_products, session_cart
                             )
                             
-                            if user_intent:
-                                action = user_intent['action']
-                                product_name = user_intent['product_name']
-                                brand = user_intent['brand']
-                                quantity = user_intent['quantity']
-                                matched_products = user_intent['matched_products']
+                            if not user_intent:
+                                continue
                                 
-                                # Build JSON context for Nova Sonic
-                                context_json = {
-                                    "action": action,
-                                    "product_name": product_name,
-                                    "brand": brand,
-                                    "quantity": quantity,
-                                    "options": []
+                            action = user_intent['action']
+                            product_name = user_intent['product_name']
+                            brand = user_intent['brand']
+                            quantity = user_intent['quantity'] or 1.0
+                            is_relative = user_intent.get('is_relative', False)
+                            
+                            # === SMART OVERRIDES (before product resolution) ===
+                            if action == 'update' and len(session_cart) == 0:
+                                # UPDATE on empty cart → override to ADD
+                                action = 'add'
+                                msg = f"Sir, cart khali hai. {product_name} add kar deta hoon"
+                                pcm = await generate_sarvam_tts(msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                                logger.info(f"⚡ Smart override: UPDATE on empty cart → ADD")
+                            elif action == 'remove' and len(session_cart) == 0:
+                                # REMOVE on empty cart → inform and skip
+                                msg = f"Sir, cart khali hai, kuch nahi hai remove karne ko"
+                                pcm = await generate_sarvam_tts(msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                                logger.info(f"⚡ Smart override: REMOVE on empty cart → inform")
+                                shared_state['processing'] = False
+                                continue
+                            
+                            # 2. Resolve Products (Unified pipeline)
+                            matches, source_store, needs_approval = await _resolve_products(
+                                product_name, brand, context_products, 
+                                shared_state['approved_stores'], current_store_id, 
+                                intent_classifier
+                            )
+                            
+                            if len(matches) == 0:
+                                # Not found anywhere → IDLE
+                                msg = f"Sir, {product_name} available nahi hai"
+                                pcm = await generate_sarvam_tts(msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                                logger.info(f"🚫 No matches for '{product_name}'")
+                                
+                            elif needs_approval:
+                                # Found cross-store -> AWAITING_STORE_APPROVAL
+                                store_names = {
+                                    'DEMO_STORE_1': 'TestShop 1',
+                                    'DEMO_STORE_2': 'TestShop 2',
+                                    'DEMO_STORE_3': 'TestShop 3'
+                                }
+                                store_name = store_names.get(source_store, 'other shop')
+                                
+                                shared_state['state'] = ConversationState.AWAITING_STORE_APPROVAL
+                                shared_state['pending'] = {
+                                    'action': action,
+                                    'products': matches,
+                                    'quantity': quantity,
+                                    'source_store_id': source_store,
+                                    'product_name': product_name
                                 }
                                 
-                                # Add product options
-                                for prod in matched_products[:5]:  # Max 5 options
-                                    prod_id = str(prod.get('id', prod.get('_id', '')))
-                                    context_json["options"].append({
-                                        "product_id": prod_id,
-                                        "name": prod.get('name'),
-                                        "brand": prod.get('brand'),
-                                        "price": prod.get('price', 0),
-                                        "unit": prod.get('weight', prod.get('unit')),
-                                        "in_cart": session_cart.get(prod_id, 0)
+                                # Send cross-store question directly via manual TTS
+                                # (Don't rely on Nova Sonic — its responses are suppressed in this state)
+                                cross_msg = f"Sir, {product_name} yahan nahi hai, lekin {store_name} mein available hai. Wahan se add kar dun?"
+                                pcm = await generate_sarvam_tts(cross_msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': cross_msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                                logger.info(f"🏪 Cross-store confirmation required for {source_store}")
+                                
+                            elif len(matches) == 1:
+                                product = matches[0]
+                                prod_id = _get_prod_id(product)
+                                current_qty = session_cart.get(prod_id, 0)
+                                
+                                # Smart overrides for single match
+                                if action in ('update', 'remove') and current_qty == 0:
+                                    if action == 'update':
+                                        # UPDATE on item not in cart → override to ADD
+                                        action = 'add'
+                                        logger.info(f"⚡ Smart override: UPDATE on {product['name']} not in cart → ADD")
+                                    else:
+                                        # REMOVE on item not in cart → inform
+                                        msg = f"Sir, {product['name']} cart mein nahi hai, hata nahi sakta"
+                                        pcm = await generate_sarvam_tts(msg)
+                                        await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                        if pcm: await websocket.send_bytes(pcm)
+                                        logger.info(f"⚡ Smart override: REMOVE on {product['name']} not in cart → inform")
+                                        shared_state['processing'] = False
+                                        continue
+                                
+                                # Handle relative quantity for UPDATE
+                                if action == 'update' and is_relative and current_qty > 0:
+                                    new_qty = current_qty + quantity
+                                    if new_qty <= 0:
+                                        # Relative math dropped to 0 → route to REMOVE
+                                        action = 'remove'
+                                        quantity = 0
+                                        logger.info(f"⚡ Relative qty update → qty={new_qty} ≤ 0. Auto-routing to REMOVE")
+                                    else:
+                                        quantity = new_qty
+                                        logger.info(f"📐 Relative qty: {current_qty} + {user_intent['quantity']} = {new_qty}")
+                                
+                                if action == 'query' and current_qty > 0:
+                                    # Item explicitly queried but already in cart → AWAITING_CLARIFICATION
+                                    shared_state['state'] = ConversationState.AWAITING_CLARIFICATION
+                                    shared_state['pending'] = {
+                                        'action': 'query_existing',
+                                        'product': product,
+                                        'current_quantity': current_qty
+                                    }
+                                    
+                                    # Manual TTS clarification prompt (don't rely on Nova Sonic)
+                                    clar_msg = f"Sir, {product['name']} already cart mein hai, {int(current_qty)} quantity. Aur add karun, quantity change karun, ya hata dun?"
+                                    pcm = await generate_sarvam_tts(clar_msg)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': clar_msg, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+                                    logger.info(f"📋 QUERY existing item: {product['name']} (qty: {current_qty})")
+                                else:
+                                    # Single match → AWAITING_CONFIRM (Voice confirmation)
+                                    final_action = 'add' if action == 'query' else action
+                                    shared_state['state'] = ConversationState.AWAITING_CONFIRM
+                                    shared_state['pending'] = {
+                                        'action': final_action,
+                                        'product': product,
+                                        'quantity': quantity
+                                    }
+                                    
+                                    # Manual TTS confirmation (don't rely on Nova Sonic — it may have stale context)
+                                    if final_action == 'add':
+                                        conf_msg = f"Sir, {product['name']} add karun? {int(quantity) if quantity == int(quantity) else quantity} quantity?"
+                                    elif final_action == 'update':
+                                        conf_msg = f"Sir, {product['name']} ki quantity {int(quantity) if quantity == int(quantity) else quantity} kar dun?"
+                                    elif final_action == 'remove':
+                                        conf_msg = f"Sir, {product['name']} cart se hata dun?"
+                                    else:
+                                        conf_msg = f"Sir, {product['name']} {final_action} karun?"
+                                    
+                                    pcm = await generate_sarvam_tts(conf_msg)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+                                    logger.info(f"🧠 AWAITING_CONFIRM for {product['name']} ({final_action})")
+                                    
+                            else:
+                                # Multiple matches
+                                final_action = 'add' if action == 'query' else action
+                                
+                                # Smart in-cart filtering for all actions
+                                in_cart_matches = [
+                                    p for p in matches
+                                    if session_cart.get(_get_prod_id(p), 0) > 0
+                                ]
+                                
+                                # Debug logging
+                                for p in matches:
+                                    pid = _get_prod_id(p)
+                                    logger.info(f"🔍 Match: {p['name']} → pid='{pid}', in_cart={session_cart.get(pid, 0)}")
+                                logger.info(f"🔍 session_cart keys: {list(session_cart.keys())}")
+                                
+                                # QUERY with exactly 1 item in cart → AWAITING_CLARIFICATION
+                                if action == 'query' and len(in_cart_matches) == 1:
+                                    product = in_cart_matches[0]
+                                    prod_id = _get_prod_id(product)
+                                    current_qty = session_cart.get(prod_id, 0)
+                                    shared_state['state'] = ConversationState.AWAITING_CLARIFICATION
+                                    shared_state['pending'] = {
+                                        'action': 'query_existing',
+                                        'product': product,
+                                        'current_quantity': current_qty
+                                    }
+                                    
+                                    # Manual TTS clarification prompt
+                                    clar_msg = f"Sir, {product['name']} already cart mein hai, {int(current_qty)} quantity. Aur add karun, quantity change karun, ya hata dun?"
+                                    pcm = await generate_sarvam_tts(clar_msg)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': clar_msg, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+                                    logger.info(f"📋 QUERY existing in-cart item: {product['name']} (qty: {current_qty})")
+                                    shared_state['processing'] = False
+                                    continue
+                                
+                                # UPDATE/REMOVE with exactly 1 item in cart → AWAITING_CONFIRM
+                                if final_action in ('update', 'remove') and len(in_cart_matches) == 1:
+                                    product = in_cart_matches[0]
+                                    shared_state['state'] = ConversationState.AWAITING_CONFIRM
+                                    shared_state['pending'] = {
+                                        'action': final_action,
+                                        'product': product,
+                                        'quantity': quantity
+                                    }
+                                    
+                                    # Manual TTS confirmation
+                                    if final_action == 'update':
+                                        conf_msg = f"Sir, {product['name']} ki quantity {int(quantity) if quantity == int(quantity) else quantity} kar dun?"
+                                    else:
+                                        conf_msg = f"Sir, {product['name']} cart se hata dun?"
+                                    
+                                    pcm = await generate_sarvam_tts(conf_msg)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+                                    logger.info(f"🧠 AWAITING_CONFIRM for {product['name']} (only in-cart match, {final_action})")
+                                    shared_state['processing'] = False
+                                    continue
+                                
+                                # Narrow to in-cart matches if multiple
+                                if final_action in ('update', 'remove') and len(in_cart_matches) > 1:
+                                    matches = in_cart_matches
+                                
+                                # Show selection UI
+                                shared_state['state'] = ConversationState.AWAITING_SELECTION
+                                shared_state['pending'] = {
+                                    'action': final_action,
+                                    'products': matches,
+                                    'quantity': quantity,
+                                    'source_store_id': source_store
+                                }
+                                
+                                options = []
+                                for prod in matches[:5]:
+                                    prod_id = _get_prod_id(prod)
+                                    options.append({
+                                        "product_id": prod_id, "name": prod.get('name'), "brand": prod.get('brand'),
+                                        "price": prod.get('price', 0), "unit": prod.get('weight', prod.get('unit')),
+                                        "in_cart": int(session_cart.get(prod_id, 0)), "store_id": prod.get('store_id')
                                     })
                                 
-                                # Handle pending action logic
-                                if pending_action and pending_action.get('awaiting_selection'):
-                                    # User is clarifying which product - keep original action
-                                    # Find the selected product from matched_products
-                                    selected_product = None
-                                    for prod in matched_products:
-                                        # Check if this product matches the clarification
-                                        prod_name_lower = prod.get('name', '').lower()
-                                        if brand and brand.lower() in prod_name_lower:
-                                            selected_product = prod
-                                            break
-                                        elif product_name.lower() in prod_name_lower:
-                                            selected_product = prod
-                                            break
+                                await websocket.send_text(json.dumps({
+                                    'event': 'product_selection',
+                                    'product_name': product_name,
+                                    'action': final_action,
+                                    'quantity': quantity,
+                                    'options': options
+                                }))
+                                
+                                # Send manual TTS (don't rely on Nova Sonic — its response is suppressed in AWAITING_SELECTION)
+                                sel_msg = f"Sir, {len(matches)} varieties available hain. Screen pe dekh lijiye"
+                                pcm = await generate_sarvam_tts(sel_msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': sel_msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                                logger.info(f"📋 AWAITING_SELECTION: {len(matches)} options")
+
+                        elif current_state == ConversationState.AWAITING_STORE_APPROVAL:
+                            # Handle cross-store YES/NO/CANCEL
+                            pending = shared_state['pending']
+                            text_lower_check = text.strip().lower()
+                            
+                            if text_lower_check in CANCEL_KEYWORDS:
+                                shared_state['state'] = ConversationState.IDLE
+                                shared_state['pending'] = None
+                                msg = "Theek hai"
+                                pcm = await generate_sarvam_tts(msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                                logger.info("🛑 CANCEL in AWAITING_STORE_APPROVAL")
+                            else:
+                                confirmation = await intent_classifier.classify_confirmation(text)
+                            
+                                if confirmation['decision'] == 'yes' and confirmation['confidence'] >= 0.6:
+                                    # Store approved! Transition to 1 match or N matches logic
+                                    source_store = pending['source_store_id']
+                                    shared_state['approved_stores'].add(source_store)
+                                    matches = pending['products']
                                     
-                                    if selected_product:
-                                        # Update pending action with selected product
-                                        pending_action = {
-                                            'action': pending_action['action'],  # Keep original action (add/update/remove)
-                                            'product': selected_product,
-                                            'quantity': pending_action['quantity'],
-                                            'awaiting_selection': False  # Selection complete
-                                        }
-                                        logger.info(f"🎯 User clarified: {selected_product['name']}")
-                                
-                                # Store NEW pending action only if not clarifying
-                                elif action in ['add', 'update', 'remove']:
-                                    if len(matched_products) == 1:
-                                        # Single product - store for immediate execution
-                                        pending_action = {
-                                            'action': action,
-                                            'product': matched_products[0],
-                                            'quantity': quantity if quantity else 1.0,
-                                            'awaiting_selection': False
-                                        }
+                                    # Auto-merge into context
+                                    for p in matches:
+                                        if p not in context_products:
+                                            context_products.append(p)
+                                    logger.info(f"🏪 Approved store {source_store}, merged products into context")
+                                    
+                                    if len(matches) == 1:
+                                        # Execute immediately
+                                        product = matches[0]
+                                        await _execute_cart_action(
+                                            pending['action'], product, pending['quantity'],
+                                            websocket, session_cart
+                                        )
+                                        shared_state['state'] = ConversationState.IDLE
+                                        shared_state['pending'] = None
+                                        
+                                        # Build dynamic confirmation text with quantity
+                                        qty_int = int(pending['quantity']) if pending['quantity'] == int(pending['quantity']) else pending['quantity']
+                                        conf_text = f"Ji sir, {product['name']} {qty_int} quantity add kar diya"
+                                        pcm = await generate_sarvam_tts(conf_text)
+                                        await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_text, 'is_user': False}))
+                                        if pcm: await websocket.send_bytes(pcm)
                                     else:
-                                        # Multiple products - store all options, will select after user clarifies
-                                        pending_action = {
-                                            'action': action,
-                                            'products': matched_products,
-                                            'quantity': quantity if quantity else 1.0,
-                                            'awaiting_selection': True
-                                        }
+                                        # Show selection UI
+                                        shared_state['state'] = ConversationState.AWAITING_SELECTION
+                                        options = []
+                                        for prod in matches[:5]:
+                                            prod_id = _get_prod_id(prod)
+                                            options.append({
+                                                "product_id": prod_id, "name": prod.get('name'), "brand": prod.get('brand'),
+                                                "price": prod.get('price', 0), "unit": prod.get('weight', prod.get('unit')),
+                                                "in_cart": int(session_cart.get(prod_id, 0)), "store_id": prod.get('store_id')
+                                            })
+                                        await websocket.send_text(json.dumps({
+                                            'event': 'product_selection', 'product_name': pending['product_name'],
+                                            'action': pending['action'], 'quantity': pending['quantity'], 'options': options
+                                        }))
+                                        
+                                        msg = f"Sir, {len(matches)} varieties available hain. Screen pe dekh lijiye"
+                                        pcm = await generate_sarvam_tts(msg)
+                                        await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                        if pcm: await websocket.send_bytes(pcm)
+                                        
+                                elif confirmation['decision'] == 'no' and confirmation['confidence'] >= 0.6:
+                                    shared_state['state'] = ConversationState.IDLE
+                                    shared_state['pending'] = None
+                                    msg = "Theek hai, nahi add karte"
+                                    pcm = await generate_sarvam_tts(msg)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+                                    logger.info("❌ Cross-store denied")
+                                else:
+                                    # Unclear — user likely said something new
+                                    logger.info(f"❓ Unclear cross-store confirmation: '{text}' — resetting to IDLE")
+                                    shared_state['state'] = ConversationState.IDLE
+                                    shared_state['pending'] = None
+                        
+                        elif current_state == ConversationState.AWAITING_CONFIRM:
+                            # Handle single item YES/NO/CANCEL
+                            text_stripped = text.strip().lower()
+                            
+                            # Check cancel keywords first — set confirmation to cancel
+                            if text_stripped in CANCEL_KEYWORDS:
+                                confirmation = {'decision': 'cancel', 'confidence': 1.0}
+                            elif text_stripped in HINDI_NUMBERS:
+                                qty = HINDI_NUMBERS[text_stripped]
+                                shared_state['pending']['quantity'] = float(qty)
+                                logger.info(f"🔢 Hindi number detected: '{text_stripped}' → qty={qty}")
+                                confirmation = {'decision': 'yes', 'confidence': 1.0}
+                            else:
+                                confirmation = await intent_classifier.classify_confirmation(text, shared_state['pending'])
+                            
+                            if confirmation['decision'] == 'yes' and confirmation['confidence'] >= 0.6:
+                                pending = shared_state['pending']
+                                await _execute_cart_action(
+                                    pending['action'], pending['product'], pending['quantity'],
+                                    websocket, session_cart
+                                )
+                                shared_state['state'] = ConversationState.IDLE
+                                shared_state['pending'] = None
                                 
-                                # Inject JSON to Nova Sonic (Sonic decides what to do)
-                                instruction = f"USER_INTENT: {json.dumps(context_json, ensure_ascii=False)}"
-                                await nova_sonic.inject_instruction(session_id, instruction)
+                                # Send TTS confirmation with quantity
+                                qty_int = int(pending['quantity']) if pending['quantity'] == int(pending['quantity']) else pending['quantity']
+                                if pending['action'] == 'remove':
+                                    conf_msg = f"Ji sir, {pending['product']['name']} cart se hata diya"
+                                elif pending['action'] == 'update':
+                                    conf_msg = f"Ji sir, {pending['product']['name']} ki quantity {qty_int} kar diya"
+                                else:
+                                    conf_msg = f"Ji sir, {pending['product']['name']} {qty_int} quantity add kar diya"
+                                pcm = await generate_sarvam_tts(conf_msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
                                 
-                                logger.info(f"🧠 → Sonic: {action.upper()} {product_name} ({len(matched_products)} options)")
-                    
+                            elif confirmation['decision'] == 'cancel':
+                                shared_state['state'] = ConversationState.IDLE
+                                shared_state['pending'] = None
+                                msg = "Theek hai, cancel"
+                                pcm = await generate_sarvam_tts(msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                                logger.info("🛑 CANCEL in AWAITING_CONFIRM")
+                            elif confirmation['decision'] == 'no' and confirmation['confidence'] >= 0.6:
+                                shared_state['state'] = ConversationState.IDLE
+                                shared_state['pending'] = None
+                                msg = "Theek hai, nahi karte"
+                                pcm = await generate_sarvam_tts(msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                                logger.info("❌ Confirmation denied")
+                            else:
+                                # Unclear — user likely said something new, re-process as new intent
+                                logger.info(f"❓ Unclear confirmation: '{text}' — re-processing as new intent")
+                                shared_state['state'] = ConversationState.IDLE
+                                shared_state['pending'] = None
+                                
+                                # Re-classify as new intent
+                                user_intent = await intent_classifier.classify_user_intent(
+                                    text, context_products, session_cart
+                                )
+                                if user_intent:
+                                    action = user_intent['action']
+                                    product_name = user_intent['product_name']
+                                    brand = user_intent['brand']
+                                    quantity = user_intent['quantity'] or 1.0
+                                    
+                                    matches, source_store, needs_approval = await _resolve_products(
+                                        product_name, brand, context_products,
+                                        shared_state['approved_stores'], current_store_id,
+                                        intent_classifier
+                                    )
+                                    
+                                    if len(matches) == 0:
+                                        msg = f"Sir, {product_name} available nahi hai"
+                                        pcm = await generate_sarvam_tts(msg)
+                                        await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                        if pcm: await websocket.send_bytes(pcm)
+                                    elif needs_approval:
+                                        store_names = {'DEMO_STORE_1': 'TestShop 1', 'DEMO_STORE_2': 'TestShop 2', 'DEMO_STORE_3': 'TestShop 3'}
+                                        store_name = store_names.get(source_store, 'other shop')
+                                        shared_state['state'] = ConversationState.AWAITING_STORE_APPROVAL
+                                        shared_state['pending'] = {'action': action, 'products': matches, 'quantity': quantity, 'source_store_id': source_store, 'product_name': product_name}
+                                        cross_msg = f"Sir, {product_name} yahan nahi hai, lekin {store_name} mein available hai. Wahan se add kar dun?"
+                                        pcm = await generate_sarvam_tts(cross_msg)
+                                        await websocket.send_text(json.dumps({'event': 'transcript', 'text': cross_msg, 'is_user': False}))
+                                        if pcm: await websocket.send_bytes(pcm)
+                                    elif len(matches) == 1:
+                                        product = matches[0]
+                                        final_action = 'add' if action == 'query' else action
+                                        shared_state['state'] = ConversationState.AWAITING_CONFIRM
+                                        shared_state['pending'] = {'action': final_action, 'product': product, 'quantity': quantity}
+                                        if final_action == 'remove':
+                                            conf_msg = f"Sir, {product['name']} cart se hata dun?"
+                                        elif final_action == 'update':
+                                            conf_msg = f"Sir, {product['name']} ki quantity {int(quantity) if quantity == int(quantity) else quantity} kar dun?"
+                                        else:
+                                            conf_msg = f"Sir, {product['name']} add karun?"
+                                        pcm = await generate_sarvam_tts(conf_msg)
+                                        await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
+                                        if pcm: await websocket.send_bytes(pcm)
+                                    else:
+                                        final_action = 'add' if action == 'query' else action
+                                        in_cart_matches = [p for p in matches if session_cart.get(_get_prod_id(p), 0) > 0]
+                                        if final_action in ('update', 'remove') and len(in_cart_matches) == 1:
+                                            product = in_cart_matches[0]
+                                            shared_state['state'] = ConversationState.AWAITING_CONFIRM
+                                            shared_state['pending'] = {'action': final_action, 'product': product, 'quantity': quantity}
+                                            if final_action == 'remove':
+                                                conf_msg = f"Sir, {product['name']} cart se hata dun?"
+                                            else:
+                                                conf_msg = f"Sir, {product['name']} ki quantity {int(quantity) if quantity == int(quantity) else quantity} kar dun?"
+                                            pcm = await generate_sarvam_tts(conf_msg)
+                                            await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
+                                            if pcm: await websocket.send_bytes(pcm)
+                                        else:
+                                            if final_action in ('update', 'remove') and len(in_cart_matches) > 1:
+                                                matches = in_cart_matches
+                                            shared_state['state'] = ConversationState.AWAITING_SELECTION
+                                            shared_state['pending'] = {'action': final_action, 'products': matches, 'quantity': quantity, 'source_store_id': source_store}
+                                            options = []
+                                            for prod in matches[:5]:
+                                                prod_id = _get_prod_id(prod)
+                                                options.append({"product_id": prod_id, "name": prod.get('name'), "brand": prod.get('brand'), "price": prod.get('price', 0), "unit": prod.get('weight', prod.get('unit')), "in_cart": int(session_cart.get(prod_id, 0)), "store_id": prod.get('store_id')})
+                                            await websocket.send_text(json.dumps({'event': 'product_selection', 'product_name': product_name, 'action': final_action, 'quantity': quantity, 'options': options}))
+                                            sel_msg = f"Sir, {len(matches)} varieties available hain. Screen pe dekh lijiye"
+                                            pcm = await generate_sarvam_tts(sel_msg)
+                                            await websocket.send_text(json.dumps({'event': 'transcript', 'text': sel_msg, 'is_user': False}))
+                                            if pcm: await websocket.send_bytes(pcm)
+                                
+                        elif current_state == ConversationState.AWAITING_SELECTION:
+                            # User should tap, but might speak or cancel
+                            pending = shared_state['pending']
+                            text_lower = text.strip().lower()
+                            
+                            # Check cancel keywords first
+                            if text_lower in CANCEL_KEYWORDS:
+                                shared_state['state'] = ConversationState.IDLE
+                                shared_state['pending'] = None
+                                await websocket.send_text(json.dumps({'event': 'clear_selection'}))
+                                msg = "Theek hai"
+                                pcm = await generate_sarvam_tts(msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                                logger.info("🛑 CANCEL in AWAITING_SELECTION")
+                                shared_state['processing'] = False
+                                continue
+                            
+                            matches = pending.get('products', [])
+                            selected_product = None
+                            for prod in matches:
+                                if text_lower in prod.get('name', '').lower() or text_lower in prod.get('brand', '').lower():
+                                    selected_product = prod
+                                    break
+                                    
+                            if selected_product:
+                                await _execute_cart_action(
+                                    pending['action'], selected_product, pending['quantity'],
+                                    websocket, session_cart
+                                )
+                                shared_state['state'] = ConversationState.IDLE
+                                shared_state['pending'] = None
+                                
+                                action_word = {'add': 'add', 'update': 'update', 'remove': 'remove'}.get(pending['action'], 'add')
+                                qty_int = int(pending['quantity']) if pending['quantity'] == int(pending['quantity']) else pending['quantity']
+                                if pending['action'] == 'remove':
+                                    conf_text = f"Ji sir, {selected_product['name']} cart se hata diya"
+                                elif pending['action'] == 'update':
+                                    conf_text = f"Ji sir, {selected_product['name']} ki quantity {qty_int} kar diya"
+                                else:
+                                    conf_text = f"Ji sir, {selected_product['name']} {qty_int} quantity add kar diya"
+                                pcm = await generate_sarvam_tts(conf_text)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_text, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                            else:
+                                # No voice match in selection list — reset to IDLE
+                                # and re-process as new intent
+                                shared_state['state'] = ConversationState.IDLE
+                                shared_state['pending'] = None
+                                logger.info(f"🔄 Unrelated speech in AWAITING_SELECTION: '{text}' — re-processing as new intent")
+                                
+                                # Re-run IDLE logic for this speech
+                                user_intent = await intent_classifier.classify_user_intent(
+                                    text, context_products, session_cart
+                                )
+                                if user_intent:
+                                    action = user_intent['action']
+                                    product_name = user_intent['product_name']
+                                    brand = user_intent['brand']
+                                    quantity = user_intent['quantity'] or 1.0
+                                    
+                                    matches, source_store, needs_approval = await _resolve_products(
+                                        product_name, brand, context_products,
+                                        shared_state['approved_stores'], current_store_id,
+                                        intent_classifier
+                                    )
+                                    
+                                    if len(matches) == 0:
+                                        msg = f"Sir, {product_name} available nahi hai"
+                                        pcm = await generate_sarvam_tts(msg)
+                                        await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                        if pcm: await websocket.send_bytes(pcm)
+                                    elif needs_approval:
+                                        store_names = {'DEMO_STORE_1': 'TestShop 1', 'DEMO_STORE_2': 'TestShop 2', 'DEMO_STORE_3': 'TestShop 3'}
+                                        store_name = store_names.get(source_store, 'other shop')
+                                        shared_state['state'] = ConversationState.AWAITING_STORE_APPROVAL
+                                        shared_state['pending'] = {'action': action, 'products': matches, 'quantity': quantity, 'source_store_id': source_store, 'product_name': product_name}
+                                        cross_msg = f"Sir, {product_name} yahan nahi hai, lekin {store_name} mein available hai. Wahan se add kar dun?"
+                                        pcm = await generate_sarvam_tts(cross_msg)
+                                        await websocket.send_text(json.dumps({'event': 'transcript', 'text': cross_msg, 'is_user': False}))
+                                        if pcm: await websocket.send_bytes(pcm)
+                                    elif len(matches) == 1:
+                                        product = matches[0]
+                                        final_action = 'add' if action == 'query' else action
+                                        shared_state['state'] = ConversationState.AWAITING_CONFIRM
+                                        shared_state['pending'] = {'action': final_action, 'product': product, 'quantity': quantity}
+                                        if final_action == 'remove':
+                                            conf_msg = f"Sir, {product['name']} cart se hata dun?"
+                                        elif final_action == 'update':
+                                            conf_msg = f"Sir, {product['name']} ki quantity {int(quantity) if quantity == int(quantity) else quantity} kar dun?"
+                                        else:
+                                            conf_msg = f"Sir, {product['name']} add karun?"
+                                        pcm = await generate_sarvam_tts(conf_msg)
+                                        await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
+                                        if pcm: await websocket.send_bytes(pcm)
+                                    else:
+                                        final_action = 'add' if action == 'query' else action
+                                        shared_state['state'] = ConversationState.AWAITING_SELECTION
+                                        shared_state['pending'] = {'action': final_action, 'products': matches, 'quantity': quantity, 'source_store_id': source_store}
+                                        options = []
+                                        for prod in matches[:5]:
+                                            prod_id = _get_prod_id(prod)
+                                            options.append({"product_id": prod_id, "name": prod.get('name'), "brand": prod.get('brand'), "price": prod.get('price', 0), "unit": prod.get('weight', prod.get('unit')), "in_cart": int(session_cart.get(prod_id, 0)), "store_id": prod.get('store_id')})
+                                        await websocket.send_text(json.dumps({'event': 'product_selection', 'product_name': product_name, 'action': final_action, 'quantity': quantity, 'options': options}))
+                                        sel_msg = f"Sir, {len(matches)} varieties available hain. Screen pe dekh lijiye"
+                                        pcm = await generate_sarvam_tts(sel_msg)
+                                        await websocket.send_text(json.dumps({'event': 'transcript', 'text': sel_msg, 'is_user': False}))
+                                        if pcm: await websocket.send_bytes(pcm)
+                                
+                        elif current_state == ConversationState.AWAITING_CLARIFICATION:
+                            pending = shared_state['pending']
+                            text_lower_clar = text.strip().lower()
+                            
+                            # Check cancel keywords first
+                            if text_lower_clar in CANCEL_KEYWORDS:
+                                shared_state['state'] = ConversationState.IDLE
+                                shared_state['pending'] = None
+                                msg = "Theek hai"
+                                pcm = await generate_sarvam_tts(msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                                logger.info("🛑 CANCEL in AWAITING_CLARIFICATION")
+                                shared_state['processing'] = False
+                                continue
+                            
+                            existing_intent = await intent_classifier.classify_existing_item_intent(
+                                text, pending['product']['name'], pending['current_quantity']
+                            )
+                            
+                            if existing_intent['confidence'] >= 0.6:
+                                action = existing_intent['action']
+                                quantity = existing_intent.get('quantity')
+                                product = pending['product']
+                                current_qty = pending['current_quantity']
+                                
+                                if action == 'add_more':
+                                    qty_val = quantity or 1.0
+                                    shared_state['state'] = ConversationState.AWAITING_CONFIRM
+                                    shared_state['pending'] = {'action': 'add', 'product': product, 'quantity': qty_val}
+                                    conf_msg = f"Sir, {product['name']} {int(qty_val) if qty_val == int(qty_val) else qty_val} aur add karun?"
+                                    pcm = await generate_sarvam_tts(conf_msg)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+                                elif action == 'update':
+                                    qty_val = quantity or current_qty
+                                    shared_state['state'] = ConversationState.AWAITING_CONFIRM
+                                    shared_state['pending'] = {'action': 'update', 'product': product, 'quantity': qty_val}
+                                    conf_msg = f"Sir, {product['name']} ki quantity {int(qty_val) if qty_val == int(qty_val) else qty_val} kar dun?"
+                                    pcm = await generate_sarvam_tts(conf_msg)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+                                elif action == 'remove':
+                                    shared_state['state'] = ConversationState.AWAITING_CONFIRM
+                                    shared_state['pending'] = {'action': 'remove', 'product': product, 'quantity': 0}
+                                    conf_msg = f"Sir, {product['name']} cart se hata dun?"
+                                    pcm = await generate_sarvam_tts(conf_msg)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+
+
+                        shared_state['processing'] = False  # Release processing lock
+
                     else:
-                        # AI spoke - check if it's confirming an action
-                        ai_text_lower = text.lower()
-                        
-                        # Detect confirmation phrases (AI confirming it executed the action)
-                        confirmation_phrases = [
-                            'add kar diya', 'add kar di', 'daal diya', 
-                            'hata diya', 'remove kar diya', 'nikaal diya',
-                            'quantity badal di', 'update kar diya'
-                        ]
-                        is_confirmation = any(phrase in ai_text_lower for phrase in confirmation_phrases)
-                        
-                        # Execute pending action if AI confirmed
-                        if is_confirmation and pending_action and not pending_action.get('awaiting_selection'):
-                            action = pending_action['action']
-                            product = pending_action['product']
-                            quantity = pending_action['quantity']
-                            
-                            prod_id = str(product.get('id', product.get('_id', '')))
-                            store_id = product.get('store_id', '')
-                            
-                            # Update cart
-                            if action == 'add':
-                                session_cart[prod_id] = session_cart.get(prod_id, 0) + quantity
-                            elif action == 'update':
-                                session_cart[prod_id] = quantity
-                            elif action == 'remove':
-                                session_cart.pop(prod_id, None)
-                            
-                            # Send to Flutter
-                            await websocket.send_text(json.dumps({
-                                'event': 'cart_update',
-                                'action': action,
-                                'store_id': store_id,
-                                'quantity': quantity,
-                                'product': {
-                                    'product_id': prod_id,
-                                    'store_id': store_id,
-                                    'name': product['name'],
-                                    'category': product.get('category', 'General'),
-                                    'brand': product.get('brand'),
-                                    'price': product.get('price', 0),
-                                    'unit': product.get('weight', product.get('unit')),
-                                    'stock_quantity': product.get('stock', 0),
-                                    'image_url': product.get('image_url'),
-                                    'tags': product.get('tags', []),
-                                }
-                            }))
-                            
-                            logger.info(f"✅ Executed: {action.upper()} {quantity}x {product['name']}")
-                            pending_action = None  # Clear pending action
-                        
-                        # Forward transcript + generate TTS
+                        # AI spoke — suppress during processing or non-IDLE states
+                        if shared_state.get('processing'):
+                            logger.info(f"🔇 Suppressed AI response (processing lock active)")
+                            continue
+                        if shared_state['state'] != ConversationState.IDLE:
+                            logger.info(f"🔇 Suppressed AI response because state is {shared_state['state'].name}")
+                            continue
+
+                        # Send transcript
                         await websocket.send_text(json.dumps({
                             'event': 'transcript',
                             'text': text,
                             'is_user': False
                         }))
                         
+                        # Send TTS audio
                         pcm_audio = await generate_sarvam_tts(text)
                         if pcm_audio:
                             await websocket.send_bytes(pcm_audio)
@@ -337,11 +1007,113 @@ async def customer_voice_assistant(
                         if not audio_started:
                             await nova_sonic.start_audio_input(session_id)
                             audio_started = True
+                    elif message.get('event') == 'product_selected':
+                        # User selected a product from the selection UI
+                        product_id = message.get('product_id')
+                        # Use the quantity from original request stored in pending state
+                        # (not Flutter's message, which defaults to 1.0)
+                        
+                        if shared_state['state'] == ConversationState.AWAITING_SELECTION and shared_state['pending']:
+                            # Find the selected product
+                            products = shared_state['pending'].get('products', [])
+                            selected_quantity = shared_state['pending'].get('quantity', 1.0)
+                            selected_product = None
+                            for prod in products:
+                                if _get_prod_id(prod) == product_id:
+                                    selected_product = prod
+                                    break
+                            
+                            if selected_product:
+                                # Tapping a product in the UI always means ADD
+                                action = shared_state['pending']['action']
+                                if action == 'query':
+                                    action = 'add'
+                                
+                                # Use shared helper to execute cart action
+                                await _execute_cart_action(
+                                    action, selected_product, selected_quantity,
+                                    websocket, session_cart
+                                )
+                                # If cross-store, approve the store for future requests
+                                source_store_id = shared_state['pending'].get('source_store_id')
+                                if source_store_id:
+                                    shared_state['approved_stores'].add(source_store_id)
+                                    for p in shared_state['pending'].get('products', []):
+                                        if p not in context_products:
+                                            context_products.append(p)
+                                    logger.info(f"🏪 Approved store {source_store_id}, merged products into context")
+                                    
+                                shared_state['state'] = ConversationState.IDLE
+                                shared_state['pending'] = None
+                                
+                                # AI confirms the selection — generate TTS first
+                                action_word = {'add': 'add', 'update': 'update', 'remove': 'remove'}.get(action, 'add')
+                                qty_int = int(selected_quantity) if selected_quantity == int(selected_quantity) else selected_quantity
+                                if action == 'remove':
+                                    confirmation_text = f"Ji sir, {selected_product['name']} cart se hata diya"
+                                elif action == 'update':
+                                    confirmation_text = f"Ji sir, {selected_product['name']} ki quantity {qty_int} kar diya"
+                                else:
+                                    confirmation_text = f"Ji sir, {selected_product['name']} {qty_int} quantity add kar diya"
+                                pcm_audio = await generate_sarvam_tts(confirmation_text)
+                                
+                                # Then send transcript + audio together
+                                await websocket.send_text(json.dumps({
+                                    'event': 'transcript',
+                                    'text': confirmation_text,
+                                    'is_user': False
+                                }))
+                                
+                                if pcm_audio:
+                                    await websocket.send_bytes(pcm_audio)
+                    
+                    elif message.get('event') == 'sync_cart':
+                        # Sync cart state from Flutter app on session start
+                        synced_product_ids = []
+                        for item in message.get('items', []):
+                            pid = item.get('product_id', '')
+                            qty = item.get('quantity', 0)
+                            if pid and qty > 0:
+                                session_cart[pid] = qty
+                                synced_product_ids.append(pid)
+                        logger.info(f"🔄 Synced cart from app: {len(session_cart)} items")
+                        
+                        # Auto-approve stores of synced cart items AND load their full inventory
+                        if synced_product_ids:
+                            from app.db.mongodb import get_database
+                            db = await get_database()
+                            from bson import ObjectId
+                            
+                            # Collect unique cross-store IDs
+                            cross_store_ids = set()
+                            for pid in synced_product_ids:
+                                try:
+                                    product = await db.products.find_one({'_id': ObjectId(pid)})
+                                    if product and product.get('store_id'):
+                                        store_id_val = product['store_id']
+                                        if store_id_val != current_store_id:
+                                            cross_store_ids.add(store_id_val)
+                                except Exception:
+                                    pass  # ID format mismatch, skip
+                            
+                            # Auto-approve each cross-store AND load its full inventory into context
+                            for cs_id in cross_store_ids:
+                                shared_state['approved_stores'].add(cs_id)
+                                logger.info(f"🏪 Auto-approved store {cs_id} (synced cart item)")
+                                
+                                # Load all products from this store into context_products
+                                store_products = await db.products.find({'store_id': cs_id}).to_list(length=100)
+                                for p in store_products:
+                                    if p not in context_products:
+                                        context_products.append(p)
+                                logger.info(f"📦 Loaded {len(store_products)} products from {cs_id} into context")
                 except json.JSONDecodeError:
                     pass
-                
-    except WebSocketDisconnect:
-        logger.info(f"Customer voice session ended for user: {user_id}")
+    except (WebSocketDisconnect, RuntimeError) as e:
+        if isinstance(e, RuntimeError) and "Cannot call" not in str(e):
+            logger.error(f"Error in customer voice session: {e}")
+        else:
+            logger.info(f"Customer voice session ended for user: {user_id}")
     except Exception as e:
         logger.error(f"Error in customer voice session: {e}")
     finally:

@@ -86,24 +86,33 @@ class NovaSonicService:
                 "- Keep responses SHORT (1-2 sentences)\n"
                 "- NEVER mention stock quantity\n\n"
                 "USER_INTENT JSON FORMAT:\n"
-                "You receive: {action, product_name, brand, quantity, options: [{product_id, name, brand, price, unit, in_cart}]}\n\n"
+                "You receive: {action, product_name, brand, quantity, options: [{product_id, name, brand, price, unit, in_cart, store_name?}], cross_store: bool}\n\n"
                 "CRITICAL: options.length tells you HOW MANY different products exist\n\n"
                 "HANDLING LOGIC:\n"
                 "1. QUERY (user asking):\n"
+                "   - If in_cart == true: Say 'Sir, [name] already cart mein hai ([current_quantity]x). Aur add karun, quantity change karun, ya hata dun?'\n"
+                "   - If options.length == 0: Say 'Sir, yeh item is shop mein nahi hai'\n"
+                "   - If options.length == 0 AND cross_store == true: Say 'Sir, yeh item is shop mein nahi hai, lekin [store_name] mein [name] ₹[price] ka hai. Wahan se add karun?'\n"
                 "   - If options.length == 1: Tell price, ask 'Add kar dun?'\n"
                 "   - If options.length > 1: List ALL options with prices, ask which one\n"
+                "   - Example (in cart): 'Sir, Milk already cart mein hai (2x). Aur add karun, quantity change karun, ya hata dun?'\n"
+                "   - Example (0 options): 'Sir, Pizza is shop mein nahi hai'\n"
+                "   - Example (0 options, cross-store): 'Sir, Pizza is shop mein nahi hai, lekin TestShop 2 mein Margherita Pizza ₹120 ka hai. Wahan se add karun?'\n"
                 "   - Example (1 option): 'Sir, Bread ₹40 ka hai. Add kar dun?'\n"
                 "   - Example (2 options): 'Sir, Toned Milk ₹27 aur Full Cream Milk ₹33 hai. Kaunsa chahiye?'\n\n"
                 "2. ADD (user wants to add):\n"
+                "   - If options.length == 0: Say item not available\n"
                 "   - If options.length == 1: Confirm 'Ji sir, [name] add kar diya'\n"
                 "   - If options.length > 1: Ask which brand/variant\n"
                 "   - Example (1 option): 'Ji sir, Bread add kar diya'\n"
                 "   - Example (2 options): 'Sir, Toned Milk ya Full Cream Milk? Kaunsa add karun?'\n\n"
                 "3. UPDATE/REMOVE: Same logic as ADD\n\n"
                 "NEVER HALLUCINATE:\n"
+                "- If options.length == 0, item is NOT available\n"
                 "- If options.length == 1, there is ONLY ONE product\n"
                 "- Don't say 'ek packet aur doosra packet' when there's only one option\n"
-                "- Count options array length to know how many products exist"
+                "- Count options array length to know how many products exist\n"
+                "- For cross-store items, mention the store name from store_name field"
             )
         else:
             system_prompt = (
@@ -482,10 +491,11 @@ class NovaSonicService:
                         "sessionEnd": {}
                     }
                 }))
+                # Let in-flight AWS futures resolve before closing
+                await asyncio.sleep(0.5)
                 await stream.input_stream.close()
         except Exception as e:
             logger.warning(f"Error closing stream for session {session_id}: {e}")
 
         del self.sessions[session_id]
         logger.info(f"Closed session {session_id}")
-
