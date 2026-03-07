@@ -370,8 +370,37 @@ async def search_products(
     Search products by name, tags, or category.
 
     Uses MongoDB text search for fuzzy matching.
+    Includes cross-store search for demo mode.
     """
     products = await service.search_products(q, store_id, category, limit)
+    
+    # If no results and in demo mode, search other demo stores
+    cross_store_results = []
+    if not products and store_id and store_id.startswith('DEMO_STORE_'):
+        demo_stores = ['DEMO_STORE_1', 'DEMO_STORE_2', 'DEMO_STORE_3']
+        other_stores = [s for s in demo_stores if s != store_id]
+        
+        for other_store_id in other_stores:
+            other_products = await service.search_products(q, other_store_id, category, limit)
+            if other_products:
+                # Tag products with cross-store info
+                for p in other_products:
+                    cross_store_results.append({
+                        **p.model_dump(),
+                        "is_cross_store": True,
+                        "source_store_id": other_store_id,
+                        "source_store_name": f"TestShop {other_store_id.split('_')[-1]}"
+                    })
+    
+    if cross_store_results:
+        return {
+            "query": q,
+            "results": cross_store_results,
+            "total": len(cross_store_results),
+            "is_cross_store": True,
+            "message": f"Not available in your shop, but found in other shops"
+        }
+    
     return {
         "query": q,
         "results": [ProductResponse(**p.model_dump()) for p in products],

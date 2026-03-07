@@ -453,6 +453,15 @@ class InventoryService:
             {"store_id": store_id, "is_active": True, "is_available": True}
         ):
             store_products.append(product)
+        
+        # CRITICAL DEBUG: Check if products were loaded
+        if not store_products:
+            print(f"❌ AI SCAN ERROR: No products found for store {store_id} with is_active=True and is_available=True")
+            print(f"   Checking without is_available filter...")
+            test_count = await self.products.count_documents({"store_id": store_id, "is_active": True})
+            print(f"   Products with just is_active=True: {test_count}")
+        else:
+            print(f"✅ AI Scan: Loaded {len(store_products)} products for {store_id}")
 
         for item in items:
             raw_text = item.get("raw_text", "")
@@ -486,11 +495,43 @@ class InventoryService:
             candidates = []
             search_synonyms = get_synonyms(search_term)
             
+            print(f"🔍 Searching for '{search_term}' with synonyms: {search_synonyms}")
+            
             for p in store_products:
                 product_name_lower = p["name"].lower()
-                # Check if search term or any of its synonyms match
+                brand_lower = (p.get("brand") or "").lower()
+                
+                # Exact match: Check if search term or any of its synonyms match
                 if any(syn in product_name_lower for syn in search_synonyms):
                     candidates.append(p)
+                    print(f"   ✅ Match: '{p['name']}'")
+                    continue
+                
+                # Fuzzy match for OCR errors (e.g., "biskeri" -> "bisleri")
+                product_words = product_name_lower.split()
+                found_fuzzy_match = False
+                for word in product_words:
+                    # Check similarity with search term
+                    ratio = SequenceMatcher(None, search_term.lower(), word).ratio()
+                    if ratio >= 0.75:  # 75% similarity threshold
+                        candidates.append(p)
+                        print(f"   ✅ Fuzzy match: '{search_term}' ~= '{word}' in '{p['name']}' (similarity: {ratio:.2f})")
+                        found_fuzzy_match = True
+                        break
+                    
+                    # Also check brand
+                    if brand_lower:
+                        brand_ratio = SequenceMatcher(None, search_term.lower(), brand_lower).ratio()
+                        if brand_ratio >= 0.75:
+                            candidates.append(p)
+                            print(f"   ✅ Fuzzy match: '{search_term}' ~= brand '{brand_lower}' (similarity: {brand_ratio:.2f})")
+                            found_fuzzy_match = True
+                            break
+                
+                if found_fuzzy_match:
+                    continue
+            
+            print(f"   Found {len(candidates)} candidates")
             
             # 2. ANALYZE CANDIDATES (Ambiguity & Pack Matching)
             selected_match = None
@@ -668,6 +709,110 @@ class InventoryService:
                     "suggested_products": [p["product_id"] for p in valid_suggestions[:3]] # lightweight
                  })
                  continue
+
+            # Attempt 3: Cross-store search (search other stores)
+            # IMPORTANT: In demo mode, only search other demo stores — not real stores
+            cross_store_candidates = []
+            if store_id.startswith('DEMO_STORE_'):
+                # Demo mode: only search other demo stores
+                demo_stores = ['DEMO_STORE_1', 'DEMO_STORE_2', 'DEMO_STORE_3']
+                other_demo_stores = [s for s in demo_stores if s != store_id]
+                cross_store_query = {"store_id": {"$in": other_demo_stores}, "is_active": True, "is_available": True}
+            else:
+                # Real mode: search all other stores
+                cross_store_query = {"store_id": {"$ne": store_id}, "is_active": True, "is_available": True}
+            
+            async for p in self.products.find(cross_store_query):
+                product_name_lower = p["name"].lower()
+                brand_lower = (p.get("brand") or "").lower()
+                
+                # Exact match with synonyms
+                if any(syn in product_name_lower for syn in search_synonyms):
+                    cross_store_candidates.append(p)
+                    continue
+                
+                # Fuzzy match for OCR errors (e.g., "biskeri" -> "bisleri")
+                # Check against product name words and brand
+                product_words = product_name_lower.split()
+                for word in product_words:
+                    # Check similarity with search term
+                    ratio = SequenceMatcher(None, search_term.lower(), word).ratio()
+                    if ratio >= 0.75:  # 75% similarity threshold for OCR errors
+                        cross_store_candidates.append(p)
+                        print(f"🔍 Fuzzy match: '{search_term}' ~= '{word}' in '{p['name']}' (similarity: {ratio:.2f})")
+                        break
+                    
+                    # Also check brand
+                    if brand_lower:
+                        brand_ratio = SequenceMatcher(None, search_term.lower(), brand_lower).ratio()
+                        if brand_ratio >= 0.75:
+                            cross_store_candidates.append(p)
+                            print(f"🔍 Fuzzy match: '{search_term}' ~= brand '{brand_lower}' (similarity: {brand_ratio:.2f})")
+                            break
+            
+            if cross_store_candidates:
+                # Get store names for cross-store matches
+                # Demo store name fallback (demo stores may not have DB entries)
+                demo_store_names = {
+                    'DEMO_STORE_1': 'TestShop 1 - Kirana Corner',
+                    'DEMO_STORE_2': 'TestShop 2 - Daily Needs',
+                    'DEMO_STORE_3': 'TestShop 3 - Fresh Mart',
+                }
+                store_names = {}
+                for cand in cross_store_candidates:
+                    sid = cand.get("store_id", "")
+                    if sid and sid not in store_names:
+                        if sid in demo_store_names:
+                            store_names[sid] = demo_store_names[sid]
+                        else:
+                            store_doc = await self.stores.find_one({"store_id": sid}, {"business_name": 1, "name": 1})
+                            store_names[sid] = store_doc.get("business_name") or store_doc.get("name", sid) if store_doc else sid
+                
+                # Pick best candidate from other stores
+                best_cross = cross_store_candidates[0]
+                cross_sid = best_cross.get("store_id", "")
+                
+                # Build alternatives from cross-store candidates
+                cross_alternatives = []
+                for cand in cross_store_candidates[:5]:
+                    csid = cand.get("store_id", "")
+                    cross_alternatives.append({
+                        "product_id": cand["product_id"],
+                        "name": cand["name"],
+                        "brand": cand.get("brand"),
+                        "price": cand["price"],
+                        "mrp": cand.get("mrp", cand["price"]),
+                        "unit": cand["unit"],
+                        "thumbnail": cand.get("thumbnail"),
+                        "stock_quantity": cand["stock_quantity"],
+                        "store_id": csid,
+                        "store_name": store_names.get(csid, csid),
+                    })
+                
+                matched.append(MatchedProduct(
+                    product_id=best_cross["product_id"],
+                    name=best_cross["name"],
+                    brand=best_cross.get("brand"),
+                    price=best_cross["price"],
+                    mrp=best_cross.get("mrp", best_cross["price"]),
+                    unit=best_cross["unit"],
+                    unit_value=best_cross.get("unit_value", 1),
+                    stock_quantity=best_cross["stock_quantity"],
+                    in_stock=best_cross["stock_quantity"] > 0,
+                    match_confidence=0.5,
+                    original_query=raw_text,
+                    search_term_english=search_term,
+                    matched_quantity=req_qty,
+                    line_total=best_cross["price"] * req_qty,
+                    thumbnail=best_cross.get("thumbnail"),
+                    status="cross_store",
+                    modification_reason=f"Not available in your shop. Found in {store_names.get(cross_sid, 'another shop')}.",
+                    alternatives=cross_alternatives,
+                    is_cross_store=True,
+                    source_store_id=cross_sid,
+                    source_store_name=store_names.get(cross_sid, "Another Shop"),
+                ))
+                continue
 
             # If completely unmatched
             unmatched.append({

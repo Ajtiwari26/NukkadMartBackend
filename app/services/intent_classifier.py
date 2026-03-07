@@ -475,42 +475,125 @@ Output ONLY this JSON:
         self, 
         product_name: str, 
         available_products: list,
-        threshold: float = 0.55
+        threshold: float = 0.70  # Increased from 0.55 to reduce false positives
     ) -> List[Dict]:
-        """Fuzzy match product name against available products using SequenceMatcher."""
+        """
+        Fuzzy match product name against available products using SequenceMatcher.
+        Implements term weighting to prioritize rare/specific words over common ones.
+        """
         from difflib import SequenceMatcher
         
         pn_lower = product_name.lower().strip()
+        query_words = [w for w in pn_lower.split() if len(w) >= 3]
+        
+        if not query_words:
+            return []
+        
+        # Calculate term weights (IDF-like scoring)
+        # Words that appear in fewer products get higher weights
+        term_weights = {}
+        for word in query_words:
+            count = sum(1 for p in available_products if word in p.get('name', '').lower())
+            # Inverse frequency: rare words get higher weight
+            term_weights[word] = 1.0 / (count + 1) if count > 0 else 1.0
+        
+        # Common generic words that should have low weight
+        generic_words = {'packet', 'pack', 'box', 'bottle', 'bag', 'piece', 'kg', 'gm', 'ml', 'ltr'}
+        for word in generic_words:
+            if word in term_weights:
+                term_weights[word] *= 0.3  # Reduce weight of generic words
+        
         scored = []
         
         for product in available_products:
             prod_name = product.get('name', '').lower()
             prod_words = prod_name.split()
             
-            # Score against full product name
-            full_score = SequenceMatcher(None, pn_lower, prod_name).ratio()
+            # Calculate weighted score
+            total_score = 0.0
+            matched_important_word = False
             
-            # Score against each word in product name (pick best)
-            word_scores = [SequenceMatcher(None, pn_lower, word).ratio() for word in prod_words if len(word) >= 3]
-            best_word = max(word_scores) if word_scores else 0
+            for query_word in query_words:
+                weight = term_weights.get(query_word, 1.0)
+                best_match_score = 0.0
+                
+                # Check against each product word
+                for prod_word in prod_words:
+                    if len(prod_word) >= 3:
+                        similarity = SequenceMatcher(None, query_word, prod_word).ratio()
+                        if similarity > best_match_score:
+                            best_match_score = similarity
+                
+                # Apply weight to the match score
+                weighted_score = best_match_score * weight
+                total_score += weighted_score
+                
+                # Track if we matched an important (high-weight) word
+                if best_match_score >= 0.75 and weight > 0.5:
+                    matched_important_word = True
             
-            # Also check query words against product words
-            query_words = [w for w in pn_lower.split() if len(w) >= 3]
-            cross_scores = []
-            for qw in query_words:
-                for pw in prod_words:
-                    if len(pw) >= 3:
-                        cross_scores.append(SequenceMatcher(None, qw, pw).ratio())
-            best_cross = max(cross_scores) if cross_scores else 0
+            # Normalize by number of query words
+            avg_score = total_score / len(query_words) if query_words else 0
             
-            best_score = max(full_score, best_word, best_cross)
-            
-            if best_score >= threshold:
-                scored.append((best_score, product))
+            # Require at least one strong match on an important word
+            if avg_score >= threshold and matched_important_word:
+                scored.append((avg_score, product))
         
         # Sort by score descending, return top matches
         scored.sort(key=lambda x: x[0], reverse=True)
         return [p for _, p in scored[:5]]
+
+    def _word_boundary_match(self, query_word: str, product_name: str) -> bool:
+        """
+        Match a query word against a product name using word-boundary rules.
+        - Words >= 4 chars: standard substring match (e.g., 'mirchi' matches 'Red Mirchi Powder')
+        - Words 3 chars: must match at start of a word boundary (prefix match).
+          'mir' matches 'Mirchi' but NOT 'Kashmiri'
+        - Words < 3 chars: ignored (too short to be meaningful)
+        """
+        if len(query_word) < 3:
+            return False
+        
+        prod_words = product_name.split()
+        
+        if len(query_word) == 3:
+            # Prefix-only match: query must start a word in the product name
+            return any(pw.startswith(query_word) for pw in prod_words)
+        else:
+            # Standard substring match for 4+ char words
+            return query_word in product_name
+    
+    def _score_match(self, query_words: List[str], product_name: str, available_products: list) -> float:
+        """
+        Score a product match using basic term weighting.
+        Rarer words (appearing in fewer products) contribute more to the score.
+        """
+        if not query_words:
+            return 0.0
+        
+        prod_name_lower = product_name.lower()
+        total_score = 0.0
+        matched_words = 0
+        
+        for word in query_words:
+            if self._word_boundary_match(word, prod_name_lower):
+                # Term frequency: how many products contain this word?
+                # Fewer = rarer = higher weight
+                doc_freq = sum(1 for p in available_products if word in p.get('name', '').lower())
+                if doc_freq == 0:
+                    doc_freq = 1
+                # IDF-inspired weight: log(N/df) approximation
+                import math
+                weight = math.log(max(len(available_products), 1) / doc_freq + 1)
+                total_score += weight
+                matched_words += 1
+        
+        # Bonus for matching more query words
+        if len(query_words) > 0:
+            coverage = matched_words / len(query_words)
+            total_score *= (0.5 + 0.5 * coverage)  # Coverage multiplier
+        
+        return total_score
 
     def _find_matching_products(
         self, 
@@ -521,7 +604,7 @@ Output ONLY this JSON:
         """
         Find all products matching the product name and optional brand.
         Matching order: exact → alias expansion → fuzzy match.
-        Handles speech-to-text quirks, multilingual names, and transcription errors.
+        Uses tokenized prefix matching and term weighting for better ranking.
         """
         product_name_lower = product_name.lower()
         brand_lower = brand.lower() if brand else None
@@ -531,7 +614,8 @@ Output ONLY this JSON:
         product_name_concat = product_name_lower.replace(' ', '')
         brand_concat = brand_lower.replace(' ', '') if brand_lower else None
         
-        matches = []
+        scored_matches = []  # (score, product) tuples
+        seen_ids = set()
         
         # === STEP 1: Resolve multilingual aliases ===
         all_names = self._resolve_aliases(product_name)
@@ -540,26 +624,32 @@ Output ONLY this JSON:
         if brand_lower:
             for name_variant in all_names:
                 name_concat = name_variant.replace(' ', '')
+                query_words = [w for w in name_variant.split() if len(w) >= 3]
+                
                 for product in available_products:
                     prod_name = product.get('name', '').lower()
                     prod_brand = product.get('brand', '').lower()
                     prod_name_concat = prod_name.replace(' ', '')
                     prod_brand_concat = prod_brand.replace(' ', '')
                     
-                    query_words = [w for w in name_variant.split() if len(w) >= 3]
-                    name_match = any(word in prod_name for word in query_words) if query_words else False
-                    name_match = name_match or (len(name_concat) >= 3 and name_concat in prod_name_concat)
+                    # Tokenized prefix matching (improved)
+                    name_match = any(self._word_boundary_match(w, prod_name) for w in query_words) if query_words else False
+                    name_match = name_match or (len(name_concat) >= 4 and name_concat in prod_name_concat)
                     
                     if name_match:
                         brand_in_name = brand_lower in prod_name or (brand_concat and len(brand_concat) >= 2 and brand_concat in prod_name_concat)
                         brand_in_field = brand_lower in prod_brand or prod_brand in brand_lower
                         brand_in_field = brand_in_field or (brand_concat and len(brand_concat) >= 2 and (brand_concat in prod_brand_concat or prod_brand_concat in brand_concat))
                         
-                        if (brand_in_name or brand_in_field) and product not in matches:
-                            matches.append(product)
+                        pid = product.get('id', product.get('_id', id(product)))
+                        if (brand_in_name or brand_in_field) and pid not in seen_ids:
+                            score = self._score_match(query_words, prod_name, available_products)
+                            scored_matches.append((score, product))
+                            seen_ids.add(pid)
             
-            if matches:
-                return matches
+            if scored_matches:
+                scored_matches.sort(key=lambda x: x[0], reverse=True)
+                return [p for _, p in scored_matches]
             
             # Brand-only matching
             for product in available_products:
@@ -572,28 +662,38 @@ Output ONLY this JSON:
                 brand_in_field = brand_lower in prod_brand or prod_brand in brand_lower
                 brand_in_field = brand_in_field or (brand_concat and len(brand_concat) >= 2 and (brand_concat in prod_brand_concat or prod_brand_concat in brand_concat))
                 
-                if (brand_in_name or brand_in_field) and product not in matches:
-                    matches.append(product)
+                pid = product.get('id', product.get('_id', id(product)))
+                if (brand_in_name or brand_in_field) and pid not in seen_ids:
+                    scored_matches.append((1.0, product))
+                    seen_ids.add(pid)
             
-            if matches:
-                return matches
+            if scored_matches:
+                return [p for _, p in scored_matches]
         
         # === STEP 2: Flexible name matching with all alias variants ===
         for name_variant in all_names:
             name_concat = name_variant.replace(' ', '')
+            query_words = [w for w in name_variant.split() if len(w) >= 3]
+            
             for product in available_products:
                 prod_name = product.get('name', '').lower()
                 prod_name_concat = prod_name.replace(' ', '')
                 
-                query_words = [w for w in name_variant.split() if len(w) >= 3]
-                name_match = any(word in prod_name for word in query_words) if query_words else False
-                name_match = name_match or (len(name_concat) >= 3 and name_concat in prod_name_concat)
+                # Tokenized prefix matching (improved)
+                name_match = any(self._word_boundary_match(w, prod_name) for w in query_words) if query_words else False
+                name_match = name_match or (len(name_concat) >= 4 and name_concat in prod_name_concat)
                 
-                if name_match and product not in matches:
-                    matches.append(product)
+                pid = product.get('id', product.get('_id', id(product)))
+                if name_match and pid not in seen_ids:
+                    score = self._score_match(query_words, prod_name, available_products)
+                    scored_matches.append((score, product))
+                    seen_ids.add(pid)
         
-        if matches:
-            return matches
+        if scored_matches:
+            # Sort by relevance score (highest first)
+            scored_matches.sort(key=lambda x: x[0], reverse=True)
+            logger.info(f"📊 Scored matches for '{product_name}': {[(round(s, 2), p.get('name')) for s, p in scored_matches[:5]]}")
+            return [p for _, p in scored_matches]
         
         # === STEP 3: Fuzzy matching as fallback ===
         fuzzy_matches = self._fuzzy_match_products(product_name, available_products)

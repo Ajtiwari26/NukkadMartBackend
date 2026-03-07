@@ -180,6 +180,7 @@ async def seed_demo_data():
                 "category": prod["category"],
                 "tags": prod["tags"],
                 "is_active": True,
+                "is_available": True,  # CRITICAL: Required for match_smart_cart query
                 "is_demo": True,
                 "image_url": None,
                 "created_at": now,

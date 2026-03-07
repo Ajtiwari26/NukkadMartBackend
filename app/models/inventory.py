@@ -268,6 +268,11 @@ class MatchedProduct(BaseModel):
     status: str = "perfect"  # "perfect", "size_modified", "brand_suggested", "ambiguous"
     modification_reason: Optional[str] = None
     alternatives: Optional[List[Dict]] = None  # List of alternative products when ambiguous
+    
+    # Cross-store fields (when item found in a different store)
+    is_cross_store: bool = False
+    source_store_id: Optional[str] = None
+    source_store_name: Optional[str] = None
 
 
 class ProductMatchResponse(BaseModel):
