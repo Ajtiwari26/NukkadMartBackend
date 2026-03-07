@@ -20,6 +20,42 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+def transliterate_hindi_to_english(text: str) -> str:
+    """
+    Transliterate Hindi Devanagari text to English (Roman script).
+    Converts: कॉफी → coffee, कर दो → kar do
+    """
+    # Devanagari to Roman mapping
+    devanagari_map = {
+        # Vowels
+        'अ': 'a', 'आ': 'aa', 'इ': 'i', 'ई': 'ee', 'उ': 'u', 'ऊ': 'oo',
+        'ऋ': 'ri', 'ए': 'e', 'ऐ': 'ai', 'ओ': 'o', 'औ': 'au',
+        # Consonants
+        'क': 'k', 'ख': 'kh', 'ग': 'g', 'घ': 'gh', 'ङ': 'ng',
+        'च': 'ch', 'छ': 'chh', 'ज': 'j', 'झ': 'jh', 'ञ': 'ny',
+        'ट': 't', 'ठ': 'th', 'ड': 'd', 'ढ': 'dh', 'ण': 'n',
+        'त': 't', 'थ': 'th', 'द': 'd', 'ध': 'dh', 'न': 'n',
+        'प': 'p', 'फ': 'ph', 'ब': 'b', 'भ': 'bh', 'म': 'm',
+        'य': 'y', 'र': 'r', 'ल': 'l', 'व': 'v', 'श': 'sh',
+        'ष': 'sh', 'स': 's', 'ह': 'h',
+        # Vowel signs (matras)
+        'ा': 'aa', 'ि': 'i', 'ी': 'ee', 'ु': 'u', 'ू': 'oo',
+        'ृ': 'ri', 'े': 'e', 'ै': 'ai', 'ो': 'o', 'ौ': 'au',
+        'ं': 'm', 'ः': 'h', '्': '', 'ँ': 'n',
+        # Special characters
+        'ॉ': 'o', 'ऑ': 'o',
+    }
+    
+    result = []
+    for char in text:
+        if char in devanagari_map:
+            result.append(devanagari_map[char])
+        else:
+            result.append(char)
+    
+    return ''.join(result)
+
+
 def _clean_text_for_tts(text: str) -> str:
     """Clean text for natural TTS — remove punctuation that sounds bad when read aloud."""
     # Replace ₹ symbol with "rupees" so it's spoken naturally
@@ -323,10 +359,13 @@ async def customer_voice_assistant(
                     text = response['text']
                     
                     if is_user:
-                        # Forward user transcript immediately
+                        # Transliterate Hindi Devanagari to English for product search
+                        text_transliterated = transliterate_hindi_to_english(text)
+                        
+                        # Forward transliterated transcript to user
                         await websocket.send_text(json.dumps({
                             'event': 'transcript',
-                            'text': text,
+                            'text': text_transliterated,
                             'is_user': True
                         }))
                         
@@ -336,6 +375,9 @@ async def customer_voice_assistant(
                         # Send processing indicator so user sees visual feedback
                         await websocket.send_text(json.dumps({'event': 'processing'}))
                         shared_state['processing'] = True  # Suppress AI responses during processing
+                        
+                        # Use transliterated text for intent classification
+                        text = text_transliterated
                             
                         # === STATE MACHINE: DECIDE NEXT STATE ===
                         current_state = shared_state['state']
