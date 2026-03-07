@@ -268,16 +268,17 @@ User Said: "{user_speech}"
 Available Products: {', '.join(product_list)}{cart_context}{pronoun_context}
 
 ACTIONS:
-- "query": User ASKING about product (uses "chahiye", "kya hai", "batao", "kitne ka", "price")
-- "add": User wants to ADD to cart (uses "add", "daal do", "le lunga", OR mentions quantity + product, OR ends with "kardo")
+- "add": User wants to ADD to cart (DEFAULT action - uses "add", "daal do", "le lunga", OR just mentions product name, OR mentions quantity + product, OR ends with "kardo")
+- "query": User EXPLICITLY ASKING about product details (uses question words: "kya hai", "batao", "kitne ka", "price kya hai", "size kya hai")
 - "update": User wants to CHANGE quantity of item IN CART (uses "quantity", "badhao", "kam karo", "X kar do")
 - "remove": User wants to REMOVE item (uses "hata do", "remove", "nikaal do")
 
 CRITICAL RULES:
-1. "ek/do/teen/NUMBER + PRODUCT" → action is "add" with that quantity (ONLY if item NOT in cart)
-2. "PRODUCT + kardo/card" → action is "add" with quantity 1 (ONLY if item NOT in cart)
-3. ONLY use "query" if user is ASKING (question words: "kya", "kitne", "batao")
-4. For "update": determine if quantity is ABSOLUTE or RELATIVE:
+1. DEFAULT to "add" if user just mentions a product name (e.g., "coffee", "milk", "rice")
+2. "ek/do/teen/NUMBER + PRODUCT" → action is "add" with that quantity (ONLY if item NOT in cart)
+3. "PRODUCT + kardo/card" → action is "add" with quantity 1 (ONLY if item NOT in cart)
+4. ONLY use "query" if user is EXPLICITLY ASKING with question words ("kya", "kitne", "batao", "price")
+5. For "update": determine if quantity is ABSOLUTE or RELATIVE:
    - ABSOLUTE (is_relative=false): "milk ki quantity do kardo" → set qty TO 2
    - RELATIVE (is_relative=true): "do aur milk daal do" → add 2 MORE, "ek kam kardo" → subtract 1
    - "double kardo" → is_relative=true, quantity=2 (multiply)
