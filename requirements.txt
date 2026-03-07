@@ -28,6 +28,8 @@ groq==0.4.2            # Groq API client
 # Image Processing
 Pillow==10.2.0
 
+# Vector Search
+numpy>=1.26.0
 
 # Authentication & Security
 python-jose[cryptography]==3.3.0

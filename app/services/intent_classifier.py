@@ -603,74 +603,71 @@ Output ONLY this JSON:
     ) -> List[Dict]:
         """
         Find all products matching the product name and optional brand.
-        Matching order: exact → alias expansion → fuzzy match.
-        Uses tokenized prefix matching and term weighting for better ranking.
+        Uses HybridSearchService (BM25 + vector + fuzzy) as primary,
+        with legacy keyword matching as fallback.
         """
+        # === PRIMARY: Hybrid Search (BM25 + Vector + Fuzzy) ===
+        try:
+            from app.services.search_service import get_search_service
+            search_service = get_search_service()
+            
+            # Build search query with brand if specified
+            search_query = product_name
+            if brand:
+                search_query = f"{brand} {product_name}"
+            
+            results = search_service.search(
+                query=search_query,
+                products=available_products,
+                limit=10,
+                min_score=0.12
+            )
+            
+            if results:
+                matches = [product for _, product in results]
+                logger.info(f"🔍 Hybrid search '{search_query}' → {len(matches)} results")
+                
+                # If brand specified, prioritize brand matches
+                if brand:
+                    brand_lower = brand.lower()
+                    brand_concat = brand_lower.replace(' ', '')
+                    brand_matches = []
+                    other_matches = []
+                    
+                    for product in matches:
+                        prod_name = product.get('name', '').lower()
+                        prod_brand = product.get('brand', '').lower()
+                        prod_name_concat = prod_name.replace(' ', '')
+                        prod_brand_concat = prod_brand.replace(' ', '')
+                        
+                        brand_hit = (brand_lower in prod_name or brand_lower in prod_brand or
+                                    prod_brand in brand_lower or
+                                    (len(brand_concat) >= 2 and (brand_concat in prod_name_concat or brand_concat in prod_brand_concat)))
+                        
+                        if brand_hit:
+                            brand_matches.append(product)
+                        else:
+                            other_matches.append(product)
+                    
+                    # Return brand matches first, then others
+                    if brand_matches:
+                        return brand_matches + other_matches
+                
+                return matches
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Hybrid search failed, using legacy matching: {e}")
+        
+        # === FALLBACK: Legacy keyword matching ===
         product_name_lower = product_name.lower()
         brand_lower = brand.lower() if brand else None
-        
-        # Also try concatenated version for letter-by-letter transcriptions 
-        # e.g., "m d h" → "mdh"
         product_name_concat = product_name_lower.replace(' ', '')
         brand_concat = brand_lower.replace(' ', '') if brand_lower else None
         
-        scored_matches = []  # (score, product) tuples
+        scored_matches = []
         seen_ids = set()
-        
-        # === STEP 1: Resolve multilingual aliases ===
         all_names = self._resolve_aliases(product_name)
         
-        # If brand specified, try exact brand match first
-        if brand_lower:
-            for name_variant in all_names:
-                name_concat = name_variant.replace(' ', '')
-                query_words = [w for w in name_variant.split() if len(w) >= 3]
-                
-                for product in available_products:
-                    prod_name = product.get('name', '').lower()
-                    prod_brand = product.get('brand', '').lower()
-                    prod_name_concat = prod_name.replace(' ', '')
-                    prod_brand_concat = prod_brand.replace(' ', '')
-                    
-                    # Tokenized prefix matching (improved)
-                    name_match = any(self._word_boundary_match(w, prod_name) for w in query_words) if query_words else False
-                    name_match = name_match or (len(name_concat) >= 4 and name_concat in prod_name_concat)
-                    
-                    if name_match:
-                        brand_in_name = brand_lower in prod_name or (brand_concat and len(brand_concat) >= 2 and brand_concat in prod_name_concat)
-                        brand_in_field = brand_lower in prod_brand or prod_brand in brand_lower
-                        brand_in_field = brand_in_field or (brand_concat and len(brand_concat) >= 2 and (brand_concat in prod_brand_concat or prod_brand_concat in brand_concat))
-                        
-                        pid = product.get('id', product.get('_id', id(product)))
-                        if (brand_in_name or brand_in_field) and pid not in seen_ids:
-                            score = self._score_match(query_words, prod_name, available_products)
-                            scored_matches.append((score, product))
-                            seen_ids.add(pid)
-            
-            if scored_matches:
-                scored_matches.sort(key=lambda x: x[0], reverse=True)
-                return [p for _, p in scored_matches]
-            
-            # Brand-only matching
-            for product in available_products:
-                prod_name = product.get('name', '').lower()
-                prod_brand = product.get('brand', '').lower()
-                prod_name_concat = prod_name.replace(' ', '')
-                prod_brand_concat = prod_brand.replace(' ', '')
-                
-                brand_in_name = brand_lower in prod_name or (brand_concat and len(brand_concat) >= 2 and brand_concat in prod_name_concat)
-                brand_in_field = brand_lower in prod_brand or prod_brand in brand_lower
-                brand_in_field = brand_in_field or (brand_concat and len(brand_concat) >= 2 and (brand_concat in prod_brand_concat or prod_brand_concat in brand_concat))
-                
-                pid = product.get('id', product.get('_id', id(product)))
-                if (brand_in_name or brand_in_field) and pid not in seen_ids:
-                    scored_matches.append((1.0, product))
-                    seen_ids.add(pid)
-            
-            if scored_matches:
-                return [p for _, p in scored_matches]
-        
-        # === STEP 2: Flexible name matching with all alias variants ===
         for name_variant in all_names:
             name_concat = name_variant.replace(' ', '')
             query_words = [w for w in name_variant.split() if len(w) >= 3]
@@ -679,7 +676,6 @@ Output ONLY this JSON:
                 prod_name = product.get('name', '').lower()
                 prod_name_concat = prod_name.replace(' ', '')
                 
-                # Tokenized prefix matching (improved)
                 name_match = any(self._word_boundary_match(w, prod_name) for w in query_words) if query_words else False
                 name_match = name_match or (len(name_concat) >= 4 and name_concat in prod_name_concat)
                 
@@ -690,12 +686,10 @@ Output ONLY this JSON:
                     seen_ids.add(pid)
         
         if scored_matches:
-            # Sort by relevance score (highest first)
             scored_matches.sort(key=lambda x: x[0], reverse=True)
-            logger.info(f"📊 Scored matches for '{product_name}': {[(round(s, 2), p.get('name')) for s, p in scored_matches[:5]]}")
             return [p for _, p in scored_matches]
         
-        # === STEP 3: Fuzzy matching as fallback ===
+        # === STEP 3: Fuzzy matching as final fallback ===
         fuzzy_matches = self._fuzzy_match_products(product_name, available_products)
         if fuzzy_matches:
             logger.info(f"🔍 Fuzzy matched '{product_name}' → {[p.get('name') for p in fuzzy_matches]}")

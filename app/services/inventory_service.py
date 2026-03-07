@@ -491,45 +491,57 @@ class InventoryService:
                 if unit in ['ml']: return val
                 return 0
 
-            # 1. FIND CANDIDATES (with synonym matching)
+            # 1. FIND CANDIDATES (Hybrid Search: BM25 + Vector + Fuzzy)
             candidates = []
             search_synonyms = get_synonyms(search_term)
             
             print(f"🔍 Searching for '{search_term}' with synonyms: {search_synonyms}")
             
-            for p in store_products:
-                product_name_lower = p["name"].lower()
-                brand_lower = (p.get("brand") or "").lower()
+            # PRIMARY: Use HybridSearchService for intelligent matching
+            try:
+                from app.services.search_service import get_search_service
+                hybrid_search = get_search_service()
                 
-                # Exact match: Check if search term or any of its synonyms match
-                if any(syn in product_name_lower for syn in search_synonyms):
-                    candidates.append(p)
-                    print(f"   ✅ Match: '{p['name']}'")
-                    continue
+                hybrid_results = hybrid_search.search(
+                    query=search_term,
+                    products=store_products,
+                    limit=10,
+                    min_score=0.12
+                )
                 
-                # Fuzzy match for OCR errors (e.g., "biskeri" -> "bisleri")
-                product_words = product_name_lower.split()
-                found_fuzzy_match = False
-                for word in product_words:
-                    # Check similarity with search term
-                    ratio = SequenceMatcher(None, search_term.lower(), word).ratio()
-                    if ratio >= 0.75:  # 75% similarity threshold
-                        candidates.append(p)
-                        print(f"   ✅ Fuzzy match: '{search_term}' ~= '{word}' in '{p['name']}' (similarity: {ratio:.2f})")
-                        found_fuzzy_match = True
-                        break
+                if hybrid_results:
+                    candidates = [product for _, product in hybrid_results]
+                    print(f"   🔍 Hybrid search found {len(candidates)} candidates")
+                    for c in candidates[:3]:
+                        print(f"   ✅ Match: '{c['name']}'")
+            except Exception as e:
+                print(f"   ⚠️ Hybrid search failed, using legacy: {e}")
+            
+            # FALLBACK: Legacy synonym + fuzzy matching
+            if not candidates:
+                for p in store_products:
+                    product_name_lower = p["name"].lower()
+                    brand_lower = (p.get("brand") or "").lower()
                     
-                    # Also check brand
-                    if brand_lower:
-                        brand_ratio = SequenceMatcher(None, search_term.lower(), brand_lower).ratio()
-                        if brand_ratio >= 0.75:
+                    if any(syn in product_name_lower for syn in search_synonyms):
+                        candidates.append(p)
+                        print(f"   ✅ Legacy match: '{p['name']}'")
+                        continue
+                    
+                    product_words = product_name_lower.split()
+                    for word in product_words:
+                        ratio = SequenceMatcher(None, search_term.lower(), word).ratio()
+                        if ratio >= 0.75:
                             candidates.append(p)
-                            print(f"   ✅ Fuzzy match: '{search_term}' ~= brand '{brand_lower}' (similarity: {brand_ratio:.2f})")
-                            found_fuzzy_match = True
+                            print(f"   ✅ Fuzzy match: '{search_term}' ~= '{word}' in '{p['name']}' ({ratio:.2f})")
                             break
-                
-                if found_fuzzy_match:
-                    continue
+                        if brand_lower:
+                            brand_ratio = SequenceMatcher(None, search_term.lower(), brand_lower).ratio()
+                            if brand_ratio >= 0.75:
+                                candidates.append(p)
+                                print(f"   ✅ Brand fuzzy: '{search_term}' ~= '{brand_lower}' ({brand_ratio:.2f})")
+                                break
+
             
             print(f"   Found {len(candidates)} candidates")
             
@@ -722,33 +734,32 @@ class InventoryService:
                 # Real mode: search all other stores
                 cross_store_query = {"store_id": {"$ne": store_id}, "is_active": True, "is_available": True}
             
+            
+            cross_store_products = []
             async for p in self.products.find(cross_store_query):
-                product_name_lower = p["name"].lower()
-                brand_lower = (p.get("brand") or "").lower()
-                
-                # Exact match with synonyms
-                if any(syn in product_name_lower for syn in search_synonyms):
-                    cross_store_candidates.append(p)
-                    continue
-                
-                # Fuzzy match for OCR errors (e.g., "biskeri" -> "bisleri")
-                # Check against product name words and brand
-                product_words = product_name_lower.split()
-                for word in product_words:
-                    # Check similarity with search term
-                    ratio = SequenceMatcher(None, search_term.lower(), word).ratio()
-                    if ratio >= 0.75:  # 75% similarity threshold for OCR errors
+                cross_store_products.append(p)
+            
+            # PRIMARY: Hybrid search for cross-store
+            try:
+                from app.services.search_service import get_search_service
+                hybrid_search = get_search_service()
+                cross_results = hybrid_search.search(
+                    query=search_term,
+                    products=cross_store_products,
+                    limit=5,
+                    min_score=0.15
+                )
+                if cross_results:
+                    cross_store_candidates = [p for _, p in cross_results]
+            except Exception as e:
+                print(f"   ⚠️ Cross-store hybrid search failed: {e}")
+            
+            # FALLBACK: Legacy matching for cross-store
+            if not cross_store_candidates:
+                for p in cross_store_products:
+                    product_name_lower = p["name"].lower()
+                    if any(syn in product_name_lower for syn in search_synonyms):
                         cross_store_candidates.append(p)
-                        print(f"🔍 Fuzzy match: '{search_term}' ~= '{word}' in '{p['name']}' (similarity: {ratio:.2f})")
-                        break
-                    
-                    # Also check brand
-                    if brand_lower:
-                        brand_ratio = SequenceMatcher(None, search_term.lower(), brand_lower).ratio()
-                        if brand_ratio >= 0.75:
-                            cross_store_candidates.append(p)
-                            print(f"🔍 Fuzzy match: '{search_term}' ~= brand '{brand_lower}' (similarity: {brand_ratio:.2f})")
-                            break
             
             if cross_store_candidates:
                 # Get store names for cross-store matches
