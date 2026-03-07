@@ -220,6 +220,7 @@ async def customer_voice_assistant(
         'pending': None,           # Shape: {action, products, quantity, source_store_id, ...}
         'approved_stores': set(),  # Stores user has approved for cross-store adds
         'processing': False,       # Lock: True while state machine is processing (suppress AI)
+        'last_product_name': None, # Last discussed product name for pronoun resolution ('isko')
     }
     
     # Load context
@@ -340,12 +341,79 @@ async def customer_voice_assistant(
                         current_state = shared_state['state']
                         
                         if current_state == ConversationState.IDLE:
+                            # === PRE-CLASSIFIER: Bulk store operations ===
+                            text_lower = text.strip().lower()
+                            bulk_store_match = None
+                            
+                            # Detect "remove/hata/clear all from store X" patterns
+                            store_name_map = {}
+                            for p in context_products:
+                                sid = p.get('store_id', '')
+                                sname = p.get('store_name', sid)
+                                store_name_map[sid] = sname
+                            
+                            # Match patterns: "store 2", "shop 2", "testshop 2", "dusri shop", "teesri shop"
+                            bulk_remove_patterns = [
+                                r'(?:remove|hata|nikaal|clear|empty|saaf)\s.*(?:store|shop|dukaan)\s*(\d+)',
+                                r'(?:store|shop|dukaan)\s*(\d+)\s.*(?:remove|hata|nikaal|clear|empty|saaf|sab.*hata)',
+                                r'(?:remove|hata|nikaal|clear)\s.*(?:all|sab|saare|sara).*(?:store|shop)\s*(\d+)',
+                                r'(?:store|shop)\s*(\d+)\s*(?:ke|ka|ki)?\s*(?:sab|all|saare|sara)\s.*(?:remove|hata|nikaal)',
+                            ]
+                            
+                            for pattern in bulk_remove_patterns:
+                                m = re.search(pattern, text_lower)
+                                if m:
+                                    store_num = m.group(1)
+                                    # Map store number to store_id
+                                    for sid in store_name_map:
+                                        if store_num in sid:  # e.g., "2" in "DEMO_STORE_2"
+                                            bulk_store_match = sid
+                                            break
+                                    break
+                            
+                            if bulk_store_match:
+                                # Find all cart items from this store
+                                store_items = []
+                                for p in context_products:
+                                    pid = _get_prod_id(p)
+                                    if p.get('store_id') == bulk_store_match and pid in session_cart and session_cart[pid] > 0:
+                                        store_items.append(p)
+                                
+                                if not store_items:
+                                    store_display = store_name_map.get(bulk_store_match, bulk_store_match)
+                                    msg = f"Sir, {store_display} se cart mein koi item nahi hai"
+                                    pcm = await generate_sarvam_tts(msg)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+                                else:
+                                    # Remove all items from this store
+                                    removed_names = []
+                                    for p in store_items:
+                                        await _execute_cart_action('remove', p, 0, websocket, session_cart)
+                                        removed_names.append(p['name'])
+                                    
+                                    store_display = store_name_map.get(bulk_store_match, bulk_store_match)
+                                    msg = f"Ji sir, {store_display} ke {len(store_items)} items cart se hata diye: {', '.join(removed_names)}"
+                                    pcm = await generate_sarvam_tts(msg)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+                                    logger.info(f"🗑️ Bulk removed {len(store_items)} items from store {bulk_store_match}")
+                                
+                                shared_state['processing'] = False
+                                continue
+                            
                             # 1. Classify New Intent
                             user_intent = await intent_classifier.classify_user_intent(
-                                text, context_products, session_cart
+                                text, context_products, session_cart, shared_state.get('last_product_name')
                             )
                             
                             if not user_intent:
+                                # Unrecognized speech — send a helpful fallback
+                                msg = "Sir, kya chahiye? Product ka naam boliye"
+                                pcm = await generate_sarvam_tts(msg)
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                if pcm: await websocket.send_bytes(pcm)
+                                shared_state['processing'] = False
                                 continue
                                 
                             action = user_intent['action']
@@ -486,6 +554,7 @@ async def customer_voice_assistant(
                                     await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
                                     if pcm: await websocket.send_bytes(pcm)
                                     logger.info(f"🧠 AWAITING_CONFIRM for {product['name']} ({final_action})")
+                                    shared_state['last_product_name'] = product['name']
                                     
                             else:
                                 # Multiple matches
@@ -544,6 +613,7 @@ async def customer_voice_assistant(
                                     await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
                                     if pcm: await websocket.send_bytes(pcm)
                                     logger.info(f"🧠 AWAITING_CONFIRM for {product['name']} (only in-cart match, {final_action})")
+                                    shared_state['last_product_name'] = product['name']
                                     shared_state['processing'] = False
                                     continue
                                 
@@ -664,7 +734,7 @@ async def customer_voice_assistant(
                                     shared_state['pending'] = None
                         
                         elif current_state == ConversationState.AWAITING_CONFIRM:
-                            # Handle single item YES/NO/CANCEL
+                            # Handle single item YES/NO/CANCEL (with optional quantity override)
                             text_stripped = text.strip().lower()
                             
                             # Check cancel keywords first — set confirmation to cancel
@@ -677,6 +747,39 @@ async def customer_voice_assistant(
                                 confirmation = {'decision': 'yes', 'confidence': 1.0}
                             else:
                                 confirmation = await intent_classifier.classify_confirmation(text, shared_state['pending'])
+                                
+                                # === QUANTITY OVERRIDE: extract number from confirmation text ===
+                                # e.g., "haan do packet", "kardo lekin 3", "ok 5 daal do", "haan aadha kilo"
+                                if confirmation['decision'] == 'yes':
+                                    # Check for Hindi number words in the text
+                                    HINDI_QTY_MAP = {
+                                        'ek': 1, 'do': 2, 'teen': 3, 'char': 4, 'chaar': 4,
+                                        'paanch': 5, 'panch': 5, 'chhah': 6, 'che': 6,
+                                        'saat': 7, 'aath': 8, 'nau': 9, 'das': 10,
+                                        'aadha': 0.5, 'adha': 0.5, 'dhai': 2.5, 'dedh': 1.5,
+                                        'savaa': 1.25, 'paune': 0.75,
+                                    }
+                                    detected_qty = None
+                                    words = text_stripped.split()
+                                    
+                                    for word in words:
+                                        # Check Hindi number words
+                                        if word in HINDI_QTY_MAP:
+                                            detected_qty = HINDI_QTY_MAP[word]
+                                            break
+                                        # Check English digits
+                                        try:
+                                            num = float(word)
+                                            if 0 < num <= 100:
+                                                detected_qty = num
+                                                break
+                                        except ValueError:
+                                            pass
+                                    
+                                    if detected_qty is not None:
+                                        old_qty = shared_state['pending']['quantity']
+                                        shared_state['pending']['quantity'] = float(detected_qty)
+                                        logger.info(f"🔢 Quantity override in confirmation: '{text_stripped}' → qty {old_qty} → {detected_qty}")
                             
                             if confirmation['decision'] == 'yes' and confirmation['confidence'] >= 0.6:
                                 pending = shared_state['pending']
@@ -716,20 +819,23 @@ async def customer_voice_assistant(
                                 if pcm: await websocket.send_bytes(pcm)
                                 logger.info("❌ Confirmation denied")
                             else:
-                                # Unclear — user likely said something new, re-process as new intent
-                                logger.info(f"❓ Unclear confirmation: '{text}' — re-processing as new intent")
+                                # Re-classify as new intent (pass last product for pronoun resolution like 'isko')
+                                last_product_name = None
+                                if shared_state.get('pending') and shared_state['pending'].get('product'):
+                                    last_product_name = shared_state['pending']['product'].get('name')
+                                
                                 shared_state['state'] = ConversationState.IDLE
                                 shared_state['pending'] = None
                                 
-                                # Re-classify as new intent
                                 user_intent = await intent_classifier.classify_user_intent(
-                                    text, context_products, session_cart
+                                    text, context_products, session_cart, last_product_name
                                 )
                                 if user_intent:
                                     action = user_intent['action']
                                     product_name = user_intent['product_name']
                                     brand = user_intent['brand']
                                     quantity = user_intent['quantity'] or 1.0
+                                    is_relative = user_intent.get('is_relative', False)
                                     
                                     matches, source_store, needs_approval = await _resolve_products(
                                         product_name, brand, context_products,
@@ -754,31 +860,54 @@ async def customer_voice_assistant(
                                     elif len(matches) == 1:
                                         product = matches[0]
                                         final_action = 'add' if action == 'query' else action
-                                        shared_state['state'] = ConversationState.AWAITING_CONFIRM
-                                        shared_state['pending'] = {'action': final_action, 'product': product, 'quantity': quantity}
+                                        prod_id = _get_prod_id(product)
+                                        current_qty = session_cart.get(prod_id, 0)
+                                        
+                                        # Compute final quantity for relative updates
+                                        final_qty = quantity
+                                        if final_action == 'update' and is_relative and current_qty > 0:
+                                            final_qty = current_qty + quantity
+                                        elif final_action == 'remove':
+                                            final_qty = 0
+                                        
+                                        # AUTO-EXECUTE: user already gave a clear instruction, no need for double confirmation
+                                        await _execute_cart_action(final_action, product, final_qty, websocket, session_cart)
+                                        qty_int = int(final_qty) if final_qty == int(final_qty) else final_qty
                                         if final_action == 'remove':
-                                            conf_msg = f"Sir, {product['name']} cart se hata dun?"
+                                            conf_msg = f"Ji sir, {product['name']} cart se hata diya"
                                         elif final_action == 'update':
-                                            conf_msg = f"Sir, {product['name']} ki quantity {int(quantity) if quantity == int(quantity) else quantity} kar dun?"
+                                            conf_msg = f"Ji sir, {product['name']} ki quantity {qty_int} kar diya"
                                         else:
-                                            conf_msg = f"Sir, {product['name']} add karun?"
+                                            conf_msg = f"Ji sir, {product['name']} {qty_int} quantity add kar diya"
                                         pcm = await generate_sarvam_tts(conf_msg)
                                         await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
                                         if pcm: await websocket.send_bytes(pcm)
+                                        logger.info(f"✅ Auto-executed (re-process): {final_action.upper()} {final_qty}x {product['name']}")
                                     else:
                                         final_action = 'add' if action == 'query' else action
                                         in_cart_matches = [p for p in matches if session_cart.get(_get_prod_id(p), 0) > 0]
                                         if final_action in ('update', 'remove') and len(in_cart_matches) == 1:
                                             product = in_cart_matches[0]
-                                            shared_state['state'] = ConversationState.AWAITING_CONFIRM
-                                            shared_state['pending'] = {'action': final_action, 'product': product, 'quantity': quantity}
+                                            prod_id = _get_prod_id(product)
+                                            current_qty = session_cart.get(prod_id, 0)
+                                            
+                                            final_qty = quantity
+                                            if final_action == 'update' and is_relative and current_qty > 0:
+                                                final_qty = current_qty + quantity
+                                            elif final_action == 'remove':
+                                                final_qty = 0
+                                            
+                                            # AUTO-EXECUTE: single in-cart match, clear instruction
+                                            await _execute_cart_action(final_action, product, final_qty, websocket, session_cart)
+                                            qty_int = int(final_qty) if final_qty == int(final_qty) else final_qty
                                             if final_action == 'remove':
-                                                conf_msg = f"Sir, {product['name']} cart se hata dun?"
+                                                conf_msg = f"Ji sir, {product['name']} cart se hata diya"
                                             else:
-                                                conf_msg = f"Sir, {product['name']} ki quantity {int(quantity) if quantity == int(quantity) else quantity} kar dun?"
+                                                conf_msg = f"Ji sir, {product['name']} ki quantity {qty_int} kar diya"
                                             pcm = await generate_sarvam_tts(conf_msg)
                                             await websocket.send_text(json.dumps({'event': 'transcript', 'text': conf_msg, 'is_user': False}))
                                             if pcm: await websocket.send_bytes(pcm)
+                                            logger.info(f"✅ Auto-executed (re-process, in-cart): {final_action.upper()} {final_qty}x {product['name']}")
                                         else:
                                             if final_action in ('update', 'remove') and len(in_cart_matches) > 1:
                                                 matches = in_cart_matches
@@ -957,25 +1086,10 @@ async def customer_voice_assistant(
                         shared_state['processing'] = False  # Release processing lock
 
                     else:
-                        # AI spoke — suppress during processing or non-IDLE states
-                        if shared_state.get('processing'):
-                            logger.info(f"🔇 Suppressed AI response (processing lock active)")
-                            continue
-                        if shared_state['state'] != ConversationState.IDLE:
-                            logger.info(f"🔇 Suppressed AI response because state is {shared_state['state'].name}")
-                            continue
-
-                        # Send transcript
-                        await websocket.send_text(json.dumps({
-                            'event': 'transcript',
-                            'text': text,
-                            'is_user': False
-                        }))
-                        
-                        # Send TTS audio
-                        pcm_audio = await generate_sarvam_tts(text)
-                        if pcm_audio:
-                            await websocket.send_bytes(pcm_audio)
+                        # Nova Sonic AI spoke — ALWAYS suppress.
+                        # Nova Sonic is used ONLY for transcription (STT).
+                        # All responses are generated by our state machine + Sarvam TTS.
+                        logger.info(f"🔇 Suppressed Nova Sonic AI: {text[:80]}...")
                             
         except Exception as e:
             logger.error(f"Response forwarding error: {e}")

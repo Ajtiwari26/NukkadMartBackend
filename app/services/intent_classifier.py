@@ -79,10 +79,10 @@ class IntentClassifier:
 User just said: "{user_text}"{context}
 
 TASK: Determine if the user is:
-1. CONFIRMING (yes/kardo/haan/theek hai/ok)
-2. DENYING (no/nahi/mat karo)
-3. UNCLEAR (mumbled/unclear audio)
-4. NEW_QUERY (asking about a different product)
+1. CONFIRMING → decision: "yes" (kardo/haan/theek hai/ok)
+2. DENYING → decision: "no" (nahi/mat karo/nahi chahiye)
+3. UNCLEAR → decision: "unclear" (mumbled/unclear audio)
+4. NEW_QUERY → decision: "new_query" (asking about a different product)
 
 CRITICAL: "kardo", "kar do", "kr do", "card" (misheard) = CONFIRMING (yes)
 CRITICAL: "nahi", "mat karo", "no" = DENYING (no)
@@ -121,6 +121,11 @@ Output ONLY this JSON:
                 content = content.split("```")[1].split("```")[0].strip()
             
             classification = json.loads(content)
+            # Normalize decision values — LLM sometimes returns 'denying'/'confirming' instead of 'no'/'yes'
+            decision_map = {'denying': 'no', 'deny': 'no', 'confirming': 'yes', 'confirm': 'yes',
+                           'confirmed': 'yes', 'denied': 'no', 'cancelled': 'cancel', 'cancelling': 'cancel'}
+            raw_decision = classification['decision'].lower()
+            classification['decision'] = decision_map.get(raw_decision, raw_decision)
             logger.info(f"🤔 Confirmation: {classification['decision']} (confidence: {classification['confidence']}) - {user_text}")
             return classification
             
@@ -217,7 +222,8 @@ Output ONLY this JSON:
         self, 
         user_speech: str, 
         available_products: list,
-        current_cart: dict = None
+        current_cart: dict = None,
+        last_product_name: str = None
     ) -> Optional[Dict]:
         """
         Classify user intent using AWS Bedrock Nova Pro (reasoning model)
@@ -249,10 +255,15 @@ Output ONLY this JSON:
             if cart_items:
                 cart_context = f"\n\nCurrent Cart:\n" + "\n".join(cart_items)
         
+        # Build pronoun context
+        pronoun_context = ""
+        if last_product_name:
+            pronoun_context = f"\nLast Discussed Product: {last_product_name} (if user says 'isko', 'ise', 'ye wala', 'this', it refers to this product)"
+        
         prompt = f"""Classify user intent for voice shopping in Hindi/Hinglish. Output ONLY JSON.
 
 User Said: "{user_speech}"
-Available Products: {', '.join(product_list)}{cart_context}
+Available Products: {', '.join(product_list)}{cart_context}{pronoun_context}
 
 ACTIONS:
 - "query": User ASKING about product (uses "chahiye", "kya hai", "batao", "kitne ka", "price")
@@ -272,25 +283,33 @@ CRITICAL RULES:
    - "sunflower oil 4 aur add kardo" → update, is_relative=true, qty=4 (add 4 more)
    - "milk do aur daal do" → update, is_relative=true, qty=2 (add 2 more)
 
+PRODUCT MATCHING (MOST IMPORTANT):
+"matched_product" must be the EXACT product name from "Available Products" that best matches what the user is asking for.
+Think step by step:
+1. What did the user say? (could be Hindi, Marathi, Tamil, Bengali, Punjabi, English, or misspelled)
+2. What does that word MEAN? (translate to English if needed: haldee/haldi/halldi = turmeric, gud/gur/good = jaggery, batata/aloo = potato, doodh/dudh = milk, jal/paani = water, chawal = rice, cheeni = sugar, tel = oil, atta = flour, dahi = curd, makhan = butter)
+3. Does it SOUND LIKE any product? (koffe → coffee, jaigiri → jaggery, biscoot → biscuits)
+4. Which product from "Available Products" matches? Output that EXACT name.
+If NO product matches even after translation, set matched_product to null.
+
 EXTRACTION:
-1. product_name: Generic type (e.g., "milk", "sugar", "bread", "basmati rice")
-2. brand: Specific brand if mentioned, else null
-3. quantity: Hindi numbers: ek=1, do=2, teen=3, char=4, paanch=5. null if not mentioned.
-4. is_relative: true if user says "aur", "extra", "kam", "double" (relative change). false if setting absolute value. Only relevant for "update" action.
+1. product_name: What the user actually said (for logging)
+2. matched_product: The EXACT name from "Available Products" that matches. null if nothing matches.
+3. brand: Specific brand if mentioned, else null
+4. quantity: Hindi numbers: ek=1, do=2, teen=3, char=4, paanch=5. null if not mentioned.
+5. is_relative: true if user says "aur", "extra", "kam", "double" (relative change). false if setting absolute value.
 
 EXAMPLES:
-- "milk" → {{"action": "query", "product_name": "milk", "brand": null, "quantity": null, "is_relative": false}}
-- "ek milk" → {{"action": "add", "product_name": "milk", "brand": null, "quantity": 1, "is_relative": false}}
-- "milk ki quantity do kardo" → {{"action": "update", "product_name": "milk", "brand": null, "quantity": 2, "is_relative": false}}
-- "do aur milk daal do" → {{"action": "update", "product_name": "milk", "brand": null, "quantity": 2, "is_relative": true}}
-- "sunflower oil 4 aur add kardo" → {{"action": "update", "product_name": "sunflower oil", "brand": null, "quantity": 4, "is_relative": true}}
-- "ek milk kam kardo" → {{"action": "update", "product_name": "milk", "brand": null, "quantity": -1, "is_relative": true}}
-- "milk hata do" → {{"action": "remove", "product_name": "milk", "brand": null, "quantity": null, "is_relative": false}}
+- "haldee do packet" → {{"action": "add", "product_name": "haldee", "matched_product": "Turmeric Powder (500g)", "brand": null, "quantity": 2, "is_relative": false}}
+- "batata chahiye" → {{"action": "query", "product_name": "batata", "matched_product": "Potato (1kg)", "brand": null, "quantity": null, "is_relative": false}}
+- "ek milk" → {{"action": "add", "product_name": "milk", "matched_product": "Toned Milk (500ml)", "brand": null, "quantity": 1, "is_relative": false}}
+- "gud daal do" → {{"action": "add", "product_name": "gud", "matched_product": "Jaggery Gur (500g)", "brand": null, "quantity": 1, "is_relative": false}}
 
 Output ONLY this JSON:
 {{
     "action": "add|update|remove|query",
-    "product_name": "generic product type or null",
+    "product_name": "what user said",
+    "matched_product": "EXACT name from Available Products or null",
     "brand": "specific brand or null",
     "quantity": number or null,
     "is_relative": true or false
@@ -305,7 +324,7 @@ Output ONLY this JSON:
                 }],
                 inferenceConfig={
                     "temperature": 0.1,
-                    "maxTokens": 150
+                    "maxTokens": 200
                 }
             )
             
@@ -325,22 +344,35 @@ Output ONLY this JSON:
             
             action = result['action']
             product_name = result.get('product_name')
+            matched_product_name = result.get('matched_product')  # LLM's primary match
             brand = result.get('brand')
             quantity = result.get('quantity')
             is_relative = bool(result.get('is_relative', False))
             
-            if not product_name:
+            if not product_name and not matched_product_name:
                 return None
             
-            # Find matching products from inventory
-            matched_products = self._find_matching_products(
-                product_name, 
-                brand, 
-                available_products
-            )
+            matched_products = []
+            
+            # === PRIMARY: Use LLM's matched_product (exact name from inventory) ===
+            if matched_product_name:
+                mp_lower = matched_product_name.lower()
+                for p in available_products:
+                    if mp_lower in p.get('name', '').lower() or p.get('name', '').lower() in mp_lower:
+                        matched_products.append(p)
+                
+                if matched_products:
+                    logger.info(f"🌐 LLM matched: '{product_name}' → '{matched_product_name}' → {len(matched_products)} products")
+                    product_name = matched_product_name  # Use the resolved name for downstream
+            
+            # === FALLBACK: keyword/fuzzy matching if LLM match failed ===
+            if not matched_products and product_name:
+                matched_products = self._find_matching_products(
+                    product_name, brand, available_products
+                )
             
             if not matched_products:
-                logger.warning(f"No products found in current context for: {product_name} (brand: {brand})")
+                logger.warning(f"No products found for: '{product_name}' (LLM matched: '{matched_product_name}', brand: {brand})")
             
             # Default quantity based on action
             if quantity is None:
@@ -370,6 +402,116 @@ Output ONLY this JSON:
             logger.error(f"Intent classification error: {e}")
             return None
     
+    # Multilingual alias dictionary: maps common Hindi/regional/slang names → inventory names
+    PRODUCT_ALIASES = {
+        # Dairy
+        'doodh': 'milk', 'dudh': 'milk', 'dood': 'milk',
+        # Sweeteners
+        'gud': 'jaggery', 'gur': 'jaggery', 'gurd': 'jaggery', 'good': 'jaggery',
+        'jaigiri': 'jaggery', 'jaigri': 'jaggery', 'jagiri': 'jaggery', 'jagri': 'jaggery',
+        'gulkand': 'jaggery', 'gulko': 'jaggery',
+        'cheeni': 'sugar', 'chini': 'sugar', 'shakkar': 'sugar',
+        # Grains
+        'chawal': 'rice', 'chaawal': 'rice', 'chaval': 'rice',
+        'atta': 'wheat flour', 'aata': 'wheat flour', 'gehu': 'wheat',
+        'maida': 'refined flour', 'besan': 'gram flour',
+        'daal': 'dal', 'dal': 'dal', 'daaal': 'dal',
+        # Oil
+        'tel': 'oil', 'tail': 'oil',
+        # Bread
+        'roti': 'bread', 'pav': 'bread', 'paav': 'bread',
+        # Beverages
+        'chai': 'tea', 'chaay': 'tea', 'chay': 'tea',
+        'koffe': 'coffee', 'koffee': 'coffee', 'kafi': 'coffee', 'kaafi': 'coffee',
+        # Spices
+        'namak': 'salt', 'noon': 'salt',
+        'mirch': 'chilli', 'mirchi': 'chilli', 'laal mirch': 'red chilli',
+        'haldi': 'turmeric', 'haldy': 'turmeric', 'haldee': 'turmeric', 'halde': 'turmeric',
+        'dhaniya': 'coriander', 'dhaniye': 'coriander',
+        'jeera': 'cumin', 'zeera': 'cumin',
+        'elaichi': 'cardamom', 'ilaychi': 'cardamom',
+        'laung': 'clove', 'dalchini': 'cinnamon',
+        # Vegetables & Fruits
+        'aloo': 'potato', 'aaloo': 'potato',
+        'pyaz': 'onion', 'pyaaz': 'onion', 'pyaj': 'onion',
+        'tamatar': 'tomato', 'tamaatar': 'tomato',
+        'adrak': 'ginger', 'lehsun': 'garlic', 'lahsun': 'garlic',
+        'palak': 'spinach', 'gobhi': 'cauliflower', 'gobi': 'cauliflower',
+        'matar': 'peas', 'mattar': 'peas',
+        'seb': 'apple', 'kela': 'banana', 'santara': 'orange', 'aam': 'mango',
+        'nimbu': 'lemon', 'nimboo': 'lemon',
+        # Snacks
+        'biscuit': 'biscuits', 'biskut': 'biscuits', 'biskit': 'biscuits',
+        'chips': 'chips', 'namkeen': 'namkeen', 'namkin': 'namkeen',
+        'maggi': 'noodles', 'noodle': 'noodles',
+        # Common
+        'sabun': 'soap', 'shampoo': 'shampoo',
+        'pani': 'water', 'paani': 'water',
+        'ghee': 'ghee', 'makhan': 'butter', 'makkhan': 'butter',
+        'dahi': 'curd', 'dahee': 'curd',
+        'paneer': 'paneer', 'panir': 'paneer',
+        'anda': 'egg', 'ande': 'egg',
+    }
+    
+    def _resolve_aliases(self, product_name: str) -> List[str]:
+        """Resolve product name through multilingual aliases. Returns list of possible names."""
+        names = [product_name.lower()]
+        
+        # Check each word and the full name against aliases
+        pn_lower = product_name.lower().strip()
+        
+        # Full name alias check
+        if pn_lower in self.PRODUCT_ALIASES:
+            names.append(self.PRODUCT_ALIASES[pn_lower])
+        
+        # Individual word alias check
+        for word in pn_lower.split():
+            if word in self.PRODUCT_ALIASES:
+                names.append(self.PRODUCT_ALIASES[word])
+        
+        return list(set(names))
+    
+    def _fuzzy_match_products(
+        self, 
+        product_name: str, 
+        available_products: list,
+        threshold: float = 0.55
+    ) -> List[Dict]:
+        """Fuzzy match product name against available products using SequenceMatcher."""
+        from difflib import SequenceMatcher
+        
+        pn_lower = product_name.lower().strip()
+        scored = []
+        
+        for product in available_products:
+            prod_name = product.get('name', '').lower()
+            prod_words = prod_name.split()
+            
+            # Score against full product name
+            full_score = SequenceMatcher(None, pn_lower, prod_name).ratio()
+            
+            # Score against each word in product name (pick best)
+            word_scores = [SequenceMatcher(None, pn_lower, word).ratio() for word in prod_words if len(word) >= 3]
+            best_word = max(word_scores) if word_scores else 0
+            
+            # Also check query words against product words
+            query_words = [w for w in pn_lower.split() if len(w) >= 3]
+            cross_scores = []
+            for qw in query_words:
+                for pw in prod_words:
+                    if len(pw) >= 3:
+                        cross_scores.append(SequenceMatcher(None, qw, pw).ratio())
+            best_cross = max(cross_scores) if cross_scores else 0
+            
+            best_score = max(full_score, best_word, best_cross)
+            
+            if best_score >= threshold:
+                scored.append((best_score, product))
+        
+        # Sort by score descending, return top matches
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [p for _, p in scored[:5]]
+
     def _find_matching_products(
         self, 
         product_name: str, 
@@ -377,9 +519,9 @@ Output ONLY this JSON:
         available_products: list
     ) -> List[Dict]:
         """
-        Find all products matching the product name and optional brand
-        Flexible matching: "bread" matches "Egg Bread", "milk" matches "Toned Milk"
-        Handles speech-to-text quirks like "m d h" for "MDH"
+        Find all products matching the product name and optional brand.
+        Matching order: exact → alias expansion → fuzzy match.
+        Handles speech-to-text quirks, multilingual names, and transcription errors.
         """
         product_name_lower = product_name.lower()
         brand_lower = brand.lower() if brand else None
@@ -391,34 +533,35 @@ Output ONLY this JSON:
         
         matches = []
         
+        # === STEP 1: Resolve multilingual aliases ===
+        all_names = self._resolve_aliases(product_name)
+        
         # If brand specified, try exact brand match first
         if brand_lower:
-            for product in available_products:
-                prod_name = product.get('name', '').lower()
-                prod_brand = product.get('brand', '').lower()
-                prod_name_concat = prod_name.replace(' ', '')
-                prod_brand_concat = prod_brand.replace(' ', '')
-                
-                # Flexible name matching: check if ANY word from query appears in product name
-                query_words = [w for w in product_name_lower.split() if len(w) >= 3]
-                name_match = any(word in prod_name for word in query_words) if query_words else False
-                # Also try concatenated match
-                name_match = name_match or (len(product_name_concat) >= 3 and product_name_concat in prod_name_concat)
-                
-                if name_match:
-                    # Check brand match (in product name OR brand field)
-                    brand_in_name = brand_lower in prod_name or (brand_concat and len(brand_concat) >= 2 and brand_concat in prod_name_concat)
-                    brand_in_field = brand_lower in prod_brand or prod_brand in brand_lower
-                    brand_in_field = brand_in_field or (brand_concat and len(brand_concat) >= 2 and (brand_concat in prod_brand_concat or prod_brand_concat in brand_concat))
+            for name_variant in all_names:
+                name_concat = name_variant.replace(' ', '')
+                for product in available_products:
+                    prod_name = product.get('name', '').lower()
+                    prod_brand = product.get('brand', '').lower()
+                    prod_name_concat = prod_name.replace(' ', '')
+                    prod_brand_concat = prod_brand.replace(' ', '')
                     
-                    if brand_in_name or brand_in_field:
-                        matches.append(product)
+                    query_words = [w for w in name_variant.split() if len(w) >= 3]
+                    name_match = any(word in prod_name for word in query_words) if query_words else False
+                    name_match = name_match or (len(name_concat) >= 3 and name_concat in prod_name_concat)
+                    
+                    if name_match:
+                        brand_in_name = brand_lower in prod_name or (brand_concat and len(brand_concat) >= 2 and brand_concat in prod_name_concat)
+                        brand_in_field = brand_lower in prod_brand or prod_brand in brand_lower
+                        brand_in_field = brand_in_field or (brand_concat and len(brand_concat) >= 2 and (brand_concat in prod_brand_concat or prod_brand_concat in brand_concat))
+                        
+                        if (brand_in_name or brand_in_field) and product not in matches:
+                            matches.append(product)
             
-            # If brand match found, return only those
             if matches:
                 return matches
             
-            # Also try brand-only matching (user might say "mdh" and mean "MDH Masala")
+            # Brand-only matching
             for product in available_products:
                 prod_name = product.get('name', '').lower()
                 prod_brand = product.get('brand', '').lower()
@@ -435,21 +578,28 @@ Output ONLY this JSON:
             if matches:
                 return matches
         
-        # No brand specified OR no brand matches found - flexible name matching
-        for product in available_products:
-            prod_name = product.get('name', '').lower()
-            prod_name_concat = prod_name.replace(' ', '')
-            
-            # Check if ANY significant word from query appears in product name
-            query_words = [w for w in product_name_lower.split() if len(w) >= 3]
-            name_match = any(word in prod_name for word in query_words) if query_words else False
-            # Also try concatenated match for abbreviations
-            name_match = name_match or (len(product_name_concat) >= 3 and product_name_concat in prod_name_concat)
-            
-            if name_match and product not in matches:
-                matches.append(product)
+        # === STEP 2: Flexible name matching with all alias variants ===
+        for name_variant in all_names:
+            name_concat = name_variant.replace(' ', '')
+            for product in available_products:
+                prod_name = product.get('name', '').lower()
+                prod_name_concat = prod_name.replace(' ', '')
+                
+                query_words = [w for w in name_variant.split() if len(w) >= 3]
+                name_match = any(word in prod_name for word in query_words) if query_words else False
+                name_match = name_match or (len(name_concat) >= 3 and name_concat in prod_name_concat)
+                
+                if name_match and product not in matches:
+                    matches.append(product)
         
-        return matches
+        if matches:
+            return matches
+        
+        # === STEP 3: Fuzzy matching as fallback ===
+        fuzzy_matches = self._fuzzy_match_products(product_name, available_products)
+        if fuzzy_matches:
+            logger.info(f"🔍 Fuzzy matched '{product_name}' → {[p.get('name') for p in fuzzy_matches]}")
+        return fuzzy_matches
     
     async def classify_ai_response(
         self,
