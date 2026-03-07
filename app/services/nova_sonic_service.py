@@ -38,14 +38,14 @@ class NovaSonicService:
     """
 
     def __init__(self):
-        # Use Tokyo region for Nova Sonic (only available there)
+        # Use Tokyo region for Nova 2 Sonic (only available there)
         self.region = os.getenv('AWS_REGION_VOICE', 'ap-northeast-1')
-        self.model_id = 'amazon.nova-sonic-v1:0'
+        self.model_id = os.getenv('BEDROCK_NOVA_SONIC_MODEL_ID', 'amazon.nova-2-sonic-v1:0')
         self.language = os.getenv('VOICE_LANGUAGE', 'hi-IN')
         self.sessions: Dict[str, Dict] = {}
         self._client: Optional[BedrockRuntimeClient] = None
 
-        logger.info(f"Nova Sonic Service: model={self.model_id}, region={self.region}")
+        logger.info(f"Nova 2 Sonic Service: model={self.model_id}, region={self.region}")
 
     def _get_client(self) -> BedrockRuntimeClient:
         """Get or create the Bedrock Runtime client."""
