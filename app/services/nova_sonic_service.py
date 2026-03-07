@@ -38,7 +38,8 @@ class NovaSonicService:
     """
 
     def __init__(self):
-        self.region = os.getenv('AWS_REGION', 'us-east-1')
+        # Use Tokyo region for Nova Sonic (only available there)
+        self.region = os.getenv('AWS_REGION_VOICE', 'ap-northeast-1')
         self.model_id = 'amazon.nova-sonic-v1:0'
         self.language = os.getenv('VOICE_LANGUAGE', 'hi-IN')
         self.sessions: Dict[str, Dict] = {}

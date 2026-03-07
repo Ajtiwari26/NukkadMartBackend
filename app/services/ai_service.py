@@ -7,6 +7,7 @@ import json
 import base64
 import logging
 import httpx
+import asyncio
 from typing import Optional, List, Dict, Any
 
 from app.config import settings
@@ -54,26 +55,40 @@ class AIService:
             logger.info("AI service not available, using mock OCR response")
             return self._mock_ocr_response()
 
-        try:
-            # Encode image to base64
-            image_base64 = base64.b64encode(image_data).decode("utf-8")
+        # Encode image to base64
+        image_base64 = base64.b64encode(image_data).decode("utf-8")
 
-            # Determine media type
-            media_type = f"image/{image_format}"
-            if image_format == "jpg":
-                media_type = "image/jpeg"
+        # Determine media type
+        media_type = f"image/{image_format}"
+        if image_format == "jpg":
+            media_type = "image/jpeg"
 
-            # Prepare the prompt for Groq Vision
-            # Prepare the prompt for Groq Vision with strict JSON output
-            prompt = """You are an expert AI assistant for a grocery store. Your task is to extract product items from a handwritten shopping list image.
+        # Prepare the prompt for Groq Vision
+        # Prepare the prompt for Groq Vision with strict JSON output
+        prompt = """You are an expert AI assistant for an Indian grocery store (kirana shop). Your task is to extract product items from a handwritten shopping list image.
+
+IMPORTANT: This is an Indian grocery shopping list. Common items include:
+- Rice varieties: Basmati Rice, Regular Rice, Sona Masoori
+- Beverages: Bisleri Water, Coca Cola, Pepsi, Tea, Coffee
+- Staples: Atta (wheat flour), Maida, Sugar, Salt, Oil
+- Pulses: Dal, Moong Dal, Toor Dal, Chana Dal
+- Spices: Turmeric, Red Chili, Coriander
+- Dairy: Milk, Paneer, Curd, Butter, Ghee
+- Snacks: Biscuits, Namkeen, Chips
+
+READ CAREFULLY - Common handwriting mistakes to avoid:
+- "Basmati" should NOT be read as "Biscuit" or "Biskuit"
+- "Bisleri" should NOT be read as "Biscuit" or "Biskuit"  
+- "Rice" should NOT be confused with other words
+- Pay attention to word length and letter shapes
 
 Analyze the image and extract every item listed. For each item, return a JSON object with the following fields:
 
-- `raw_text`: The exact text written for this item (e.g., "200 gm Sugar", "Colgate").
-- `search_term_english`: The English translation of the product name for searching (e.g., "Sugar", "Colgate Toothpaste"). If unreadable, set to null.
+- `raw_text`: The exact text written for this item (e.g., "Basmati Rice", "Bisleri Water").
+- `search_term_english`: The English translation of the product name for searching (e.g., "Basmati Rice", "Bisleri Water"). If unreadable, set to null.
 - `req_qty`: The numeric quantity requested (e.g., 200, 1). If not specified, default to 1.
 - `req_unit`: The unit of measurement (e.g., "gm", "kg", "ml", "L", "piece"). If not specified, default to "piece".
-- `is_brand_specified`: Boolean, true if a specific brand is mentioned (e.g., "Amul", "Colgate").
+- `is_brand_specified`: Boolean, true if a specific brand is mentioned (e.g., "Bisleri", "India Gate").
 - `confidence_score`: A number between 0 and 1 indicating how confident you are in reading this item.
 - `is_unreadable`: Boolean, set to true if the text is illegible or confidence is low (< 0.5).
 
@@ -82,131 +97,159 @@ Return the result as a strictly valid JSON array of objects. Do not include any 
 Example Output:
 [
   {
-    "raw_text": "200 gm शक्कर", 
-    "search_term_english": "Sugar",
-    "req_qty": 200,
-    "req_unit": "gm",
+    "raw_text": "Basmati Rice", 
+    "search_term_english": "Basmati Rice",
+    "req_qty": 1,
+    "req_unit": "kg",
     "is_brand_specified": false,
     "confidence_score": 0.95,
     "is_unreadable": false
   },
   {
-    "raw_text": "Colgate", 
-    "search_term_english": "Colgate Toothpaste",
+    "raw_text": "Bisleri Water", 
+    "search_term_english": "Bisleri Water",
     "req_qty": 1,
-    "req_unit": "piece",
+    "req_unit": "L",
     "is_brand_specified": true,
     "confidence_score": 0.90,
     "is_unreadable": false
-  },
-  {
-    "raw_text": "hgsdks", 
-    "search_term_english": null,
-    "req_qty": 1,
-    "req_unit": "piece",
-    "is_brand_specified": false,
-    "confidence_score": 0.1,
-    "is_unreadable": true
   }
 ]"""
 
-            # Call Groq Vision API
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                payload = {
-                    "model": settings.GROQ_VISION_MODEL,
-                    "messages": [
+        # Check if Bedrock is configured
+        if not settings.AWS_REGION:
+            logger.error("AWS_REGION not configured for Bedrock OCR")
+            return {
+                "success": False,
+                "raw_text": "",
+                "error": "AWS Bedrock not configured"
+            }
+                
+        # Prepare image data for Bedrock
+        import boto3
+        try:
+            # Use region from settings, fallback to ap-south-1
+            region = settings.AWS_REGION or "ap-south-1"
+            
+            # Determine Nova Pro model - use India region for better latency
+            model_id = "apac.amazon.nova-pro-v1:0"  # India region model
+            if hasattr(settings, "BEDROCK_MODEL_ID") and getattr(settings, "BEDROCK_MODEL_ID"):
+                model_id = getattr(settings, "BEDROCK_MODEL_ID")
+            elif hasattr(settings, "BEDROCK_NOVA_PRO_MODEL_ID") and getattr(settings, "BEDROCK_NOVA_PRO_MODEL_ID"):
+                model_id = getattr(settings, "BEDROCK_NOVA_PRO_MODEL_ID")
+                
+            client_kwargs = {"region_name": region}
+            if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
+                client_kwargs["aws_access_key_id"] = settings.AWS_ACCESS_KEY_ID
+                client_kwargs["aws_secret_access_key"] = settings.AWS_SECRET_ACCESS_KEY
+            
+            bedrock_client = boto3.client("bedrock-runtime", **client_kwargs)
+            
+            logger.info(f"Calling Bedrock Converse API for OCR with model: {model_id} in {region}")
+            
+            # Create the message for Converse API with strict JSON instructions
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
                         {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": f"data:{media_type};base64,{image_base64}"
-                                    }
-                                },
-                                {
-                                    "type": "text",
-                                    "text": prompt
+                            "image": {
+                                "format": image_format if image_format in ["png", "jpeg", "webp", "gif"] else "jpeg",
+                                "source": {
+                                    "bytes": image_data
                                 }
-                            ]
+                            }
+                        },
+                        {
+                            "text": prompt
                         }
-                    ],
-                    "max_tokens": 2048,
-                    "temperature": 0.1
+                    ]
                 }
-                
-                logger.info(f"Calling Groq Vision API with model: {settings.GROQ_VISION_MODEL}")
-                
-                response = await client.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.groq_api_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json=payload
+            ]
+            
+            # Call Nova Pro using Converse API in an async executor
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: bedrock_client.converse(
+                    modelId=model_id,
+                    messages=messages,
+                    inferenceConfig={
+                        "maxTokens": 2048,
+                        "temperature": 0.0  # Set to 0 for deterministic OCR results
+                    }
                 )
-
-                if response.status_code != 200:
-                    error_text = response.text
-                    logger.error(f"Groq API error {response.status_code}: {error_text}")
-                    return {
-                        "success": False,
-                        "raw_text": "",
-                        "error": f"Groq API error {response.status_code}: {error_text}"
-                    }
-
-                result = response.json()
-
-                content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-                if not content:
-                    logger.warning("Groq returned empty content")
-                    return {
-                        "success": False,
-                        "raw_text": "",
-                        "error": "No text extracted from image"
-                    }
-
-                logger.info(f"Successfully extracted text: {content[:100]}...")
-
-                # Parse the text into structured items
-                try:
-                    # Clean up content if it contains markdown code blocks
-                    content = content.strip()
-                    if content.startswith("```json"):
-                        content = content[7:]
-                    if content.startswith("```"):
-                        content = content[3:]
-                    if content.endswith("```"):
-                        content = content[:-3]
-                    content = content.strip()
+            )
+            
+            # Extract text content from Converse response
+            content = ""
+            output_message = response.get("output", {}).get("message", {})
+            for block in output_message.get("content", []):
+                if "text" in block:
+                    content += block["text"]
                     
-                    items = json.loads(content)
-                    
-                    # Validate items structure
-                    validated_items = []
-                    for item in items:
-                        if isinstance(item, dict):
-                            validated_items.append(item)
-                            
-                    return {
-                        "success": True,
-                        "raw_text": json.dumps(validated_items, indent=2), # Store JSON representation as raw text for debugging
-                        "items": validated_items,
-                        "confidence": 0.95
-                    }
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse JSON response: {e}")
-                    # Fallback to empty list or better error handling
-                    return {
-                        "success": False,
-                        "raw_text": content,
-                        "error": "Failed to parse AI response",
-                        "items": []
-                    }
+            if not content:
+                logger.warning("Bedrock returned empty content")
+                return {
+                    "success": False,
+                    "raw_text": "",
+                    "error": "No text extracted from image"
+                }
+
+            logger.info(f"Successfully extracted OCR text via Nova Pro: {content[:100]}...")
+
+            # Parse the text into structured items
+            try:
+                # Clean up content if it contains markdown code blocks
+                content = content.strip()
+                if content.startswith("```json"):
+                    content = content[7:]
+                if content.startswith("```"):
+                    content = content[3:]
+                if content.endswith("```"):
+                    content = content[:-3]
+                content = content.strip()
+                
+                items = json.loads(content)
+                
+                # Validate items structure
+                validated_items = []
+                for item in items:
+                    if isinstance(item, dict):
+                        validated_items.append(item)
+                        
+                return {
+                    "success": True,
+                    "raw_text": json.dumps(validated_items, indent=2), # Store JSON representation as raw text for debugging
+                    "items": validated_items,
+                    "confidence": 0.95
+                }
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON response from Nova Pro: {e}")
+                import re
+                # One last attempt to find a JSON array in the text
+                json_match = re.search(r'\[[\s\S]*\]', content)
+                if json_match:
+                    try:
+                        items = json.loads(json_match.group())
+                        return {
+                            "success": True,
+                            "raw_text": json.dumps(items, indent=2),
+                            "items": items,
+                            "confidence": 0.90
+                        }
+                    except Exception:
+                        pass
+                        
+                return {
+                    "success": False,
+                    "raw_text": content,
+                    "error": "Failed to parse AI response",
+                    "items": []
+                }
 
         except Exception as e:
-            logger.error(f"Groq OCR error: {e}")
+            logger.error(f"Bedrock OCR error: {e}")
             return {
                 "success": False,
                 "raw_text": "",

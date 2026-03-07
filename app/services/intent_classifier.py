@@ -18,11 +18,13 @@ class IntentClassifier:
     """
     
     def __init__(self):
+        # Use India region (ap-south-1) for Nova Pro - better latency
         self.bedrock = boto3.client(
             'bedrock-runtime',
-            region_name=os.getenv('AWS_REGION', 'us-east-1')
+            region_name=os.getenv('AWS_REGION', 'ap-south-1')
         )
-        self.model_id = "amazon.nova-pro-v1:0"  # Reasoning model
+        # Use India-specific model ID
+        self.model_id = "apac.amazon.nova-pro-v1:0"
     
     async def classify_confirmation(
         self,
@@ -620,7 +622,7 @@ Output ONLY this JSON:
                 query=search_query,
                 products=available_products,
                 limit=10,
-                min_score=0.12
+                min_score=0.4  # Increased from 0.12 to filter out poor matches
             )
             
             if results:

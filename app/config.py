@@ -33,11 +33,14 @@ class Settings(BaseSettings):
     GROQ_VISION_MODEL: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     GROQ_TEXT_MODEL: str = "llama-3.3-70b-versatile"
 
-    # AWS Bedrock Configuration (for Amazon Nova - future use)
-    AWS_REGION: str = "ap-south-1"
+    # AWS Bedrock Configuration
+    # Nova Pro: Available in ap-south-1 (India) - used for OCR and intent classification
+    # Nova Sonic: Only available in ap-northeast-1 (Tokyo) - used for voice streaming
+    AWS_REGION: str = "ap-south-1"  # Primary region for Nova Pro
+    AWS_REGION_VOICE: str = "ap-northeast-1"  # Tokyo region for Nova Sonic
     AWS_ACCESS_KEY_ID: Optional[str] = None
     AWS_SECRET_ACCESS_KEY: Optional[str] = None
-    BEDROCK_MODEL_ID: str = "amazon.nova-pro-v1:0"
+    BEDROCK_MODEL_ID: str = "apac.amazon.nova-pro-v1:0"  # India region model
     BEDROCK_NOVA_ACT_MODEL_ID: str = "amazon.nova-act-v1:0"
     BEDROCK_NOVA_SONIC_MODEL_ID: str = "amazon.nova-sonic-v1:0"
 

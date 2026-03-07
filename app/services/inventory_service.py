@@ -506,7 +506,7 @@ class InventoryService:
                     query=search_term,
                     products=store_products,
                     limit=10,
-                    min_score=0.12
+                    min_score=0.4  # Increased from 0.12 to filter out poor matches
                 )
                 
                 if hybrid_results:
@@ -747,10 +747,13 @@ class InventoryService:
                     query=search_term,
                     products=cross_store_products,
                     limit=5,
-                    min_score=0.15
+                    min_score=0.4  # Match current store threshold to filter poor matches
                 )
                 if cross_results:
                     cross_store_candidates = [p for _, p in cross_results]
+                    print(f"   🔍 Cross-store hybrid search found {len(cross_store_candidates)} candidates")
+                    for c in cross_store_candidates[:3]:
+                        print(f"   ✅ Cross-store match: '{c['name']}' in {c.get('store_id', 'unknown')}")
             except Exception as e:
                 print(f"   ⚠️ Cross-store hybrid search failed: {e}")
             
