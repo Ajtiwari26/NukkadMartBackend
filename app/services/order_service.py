@@ -424,7 +424,7 @@ class OrderService:
         # Save to database
         await self.orders.insert_one(order)
 
-        # Update user's total purchases
+        # Update user's total purchases (upsert for demo users)
         await self.db.users.update_one(
             {"user_id": user_id},
             {
@@ -434,8 +434,15 @@ class OrderService:
                 },
                 "$set": {
                     "updated_at": now
+                },
+                "$setOnInsert": {
+                    "user_id": user_id,
+                    "name": "Demo User" if user_id == "DEMO_USER" else "User",
+                    "phone": "0000000000" if user_id == "DEMO_USER" else "",
+                    "created_at": now
                 }
-            }
+            },
+            upsert=True
         )
 
         # Store in Redis for real-time access
