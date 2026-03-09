@@ -137,7 +137,7 @@ async def quick_register_user(user: QuickUserRegister):
         "user_id": user_id,
         "name": user.name,
         "phone": user.phone,
-        "email": None,
+        # Don't include email field at all to avoid unique index conflict
         "addresses": [],
         "preferences": {
             "language": "en",
