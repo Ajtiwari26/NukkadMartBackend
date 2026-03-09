@@ -169,8 +169,8 @@ class ProductInDB(ProductBase):
     reorder_threshold: int = Field(default=10, ge=0)
     max_order_quantity: Optional[int] = None
 
-    # GST & ONDC
-    gst_info: GSTInfo
+    # GST & ONDC (optional for backward compatibility)
+    gst_info: Optional[GSTInfo] = None
     ondc_info: Optional[ONDCProductInfo] = None
 
     # Status
