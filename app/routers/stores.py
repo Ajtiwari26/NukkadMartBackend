@@ -327,8 +327,14 @@ async def find_nearby_stores(
     
     db = await get_database()
 
-    # Get all active stores
-    stores = await db.stores.find({"status": "ACTIVE"}).to_list(100)
+    # Get all active stores (EXCLUDE demo stores for real mode)
+    stores = await db.stores.find({
+        "status": "ACTIVE",
+        "$or": [
+            {"is_demo": {"$exists": False}},  # Real stores don't have is_demo field
+            {"is_demo": False}                 # Or explicitly marked as not demo
+        ]
+    }).to_list(100)
 
     nearby = []
     for store in stores:

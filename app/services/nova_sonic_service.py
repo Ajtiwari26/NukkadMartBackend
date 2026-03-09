@@ -95,10 +95,18 @@ class NovaSonicService:
                 "Use 'Sir' and 'ji' respectfully."
             )
         else:
+            # Store owner persona - TRANSCRIPTION ONLY, NO RESPONSES
             system_prompt = (
-                "You are a professional business manager for a store owner in India. "
-                "Provide analytics, insights, and reports in Hindi/Hinglish. "
-                "Be professional and data-driven."
+                "You are a voice transcription service for a store management system in India.\n\n"
+                "YOUR ONLY JOB: Transcribe user speech accurately in Hindi/Hinglish (romanized).\n\n"
+                "CRITICAL RULES:\n"
+                "1. ONLY transcribe what the user says - DO NOT generate responses\n"
+                "2. DO NOT answer questions, provide advice, or give instructions\n"
+                "3. DO NOT say anything like 'I can help you', 'follow these steps', etc.\n"
+                "4. Transcribe Hindi in romanized form: 'aaj ka stock' not 'today's stock'\n"
+                "5. Keep numbers as spoken: 'do', 'teen', 'char' (not 2, 3, 4)\n"
+                "6. If you must respond, say ONLY: 'Ji sir' (nothing more)\n\n"
+                "Remember: You are ONLY a transcription service. All responses are handled by another system."
             )
 
         # Initialize the bidirectional stream
@@ -205,21 +213,53 @@ class NovaSonicService:
         stream = session['stream']
         ctx_content_name = str(uuid.uuid4())
 
-        products = context.get('available_products', [])
+        # Support both customer context (available_products) and store context (inventory)
+        products = context.get('available_products', context.get('inventory', []))
         if not products:
             return
 
+        # For store context, include more detailed inventory information
+        is_store_context = 'inventory' in context
+        
         products_list = []
-        for p in products[:20]:
-            products_list.append(
-                f"- {p.get('name')} ({p.get('brand', 'Local')}) - ₹{p.get('price')} "
-                f"[stock: {p.get('stock', 0)}]"
-            )
+        for p in products[:50]:  # Increased from 20 to 50 for store owners
+            if is_store_context:
+                # Store owner needs detailed stock info
+                products_list.append(
+                    f"- {p.get('name')} ({p.get('brand', 'Local')}) - ₹{p.get('price')} "
+                    f"[Stock: {p.get('stock', 0)} units, Category: {p.get('category', 'General')}]"
+                )
+            else:
+                # Customer needs simpler product list
+                products_list.append(
+                    f"- {p.get('name')} ({p.get('brand', 'Local')}) - ₹{p.get('price')} "
+                    f"[stock: {p.get('stock', 0)}]"
+                )
 
-        context_text = (
-            "AVAILABLE PRODUCTS IN NEARBY STORES:\n" +
-            "\n".join(products_list)
-        )
+        if is_store_context:
+            # Store owner context
+            store_info = context.get('store_info', {})
+            analytics = context.get('analytics', {})
+            sales_data = context.get('sales_data', {})
+            
+            context_text = f"""STORE INVENTORY AND ANALYTICS:
+
+Store: {store_info.get('name', 'Your Store')}
+Total Products: {len(products)}
+Low Stock Items: {analytics.get('low_stock_count', 0)}
+Today's Revenue: ₹{sales_data.get('total_revenue', 0)}
+Today's Orders: {sales_data.get('total_orders', 0)}
+
+COMPLETE INVENTORY LIST:
+{chr(10).join(products_list)}
+
+You are a helpful store management assistant. Answer questions about inventory, stock levels, sales, and provide business insights based on this data."""
+        else:
+            # Customer context
+            context_text = (
+                "AVAILABLE PRODUCTS IN NEARBY STORES:\n" +
+                "\n".join(products_list)
+            )
 
         # contentStart (TEXT, USER)
         await self._send_event(stream, json.dumps({
@@ -253,7 +293,9 @@ class NovaSonicService:
                 }
             }
         }))
-        logger.info(f"Sent context ({len(products)} products) to Nova Sonic session {session_id}")
+        
+        context_type = "store inventory" if is_store_context else "customer products"
+        logger.info(f"Sent {context_type} context ({len(products)} products) to Nova Sonic session {session_id}")
 
     async def inject_instruction(self, session_id: str, instruction: str):
         """

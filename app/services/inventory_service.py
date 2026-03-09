@@ -405,7 +405,8 @@ class InventoryService:
     async def match_smart_cart(
         self,
         store_id: str,
-        items: List[Dict]
+        items: List[Dict],
+        is_demo: bool = False
     ) -> ProductMatchResponse:
         """
         Smart matching of OCR items to store inventory.
@@ -723,16 +724,24 @@ class InventoryService:
                  continue
 
             # Attempt 3: Cross-store search (search other stores)
-            # IMPORTANT: In demo mode, only search other demo stores — not real stores
+            # Use is_demo flag to determine which stores to search
             cross_store_candidates = []
-            if store_id.startswith('DEMO_STORE_'):
+            if is_demo:
                 # Demo mode: only search other demo stores
                 demo_stores = ['DEMO_STORE_1', 'DEMO_STORE_2', 'DEMO_STORE_3']
                 other_demo_stores = [s for s in demo_stores if s != store_id]
                 cross_store_query = {"store_id": {"$in": other_demo_stores}, "is_active": True, "is_available": True}
             else:
-                # Real mode: search all other stores
-                cross_store_query = {"store_id": {"$ne": store_id}, "is_active": True, "is_available": True}
+                # Real mode: search only real stores (exclude demo stores)
+                cross_store_query = {
+                    "store_id": {"$ne": store_id},
+                    "is_active": True,
+                    "is_available": True,
+                    "$or": [
+                        {"is_demo": {"$exists": False}},
+                        {"is_demo": False}
+                    ]
+                }
             
             
             cross_store_products = []

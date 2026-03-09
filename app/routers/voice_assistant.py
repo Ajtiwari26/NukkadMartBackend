@@ -1298,6 +1298,7 @@ async def store_voice_assistant(websocket: WebSocket, store_id: str):
     
     nova_sonic = NovaSonicService()
     context_service = VoiceContextService()
+    greeting_sent = False  # Track if greeting was sent
     
     # Create session with store management persona and tools
     session = await nova_sonic.create_session(
@@ -1318,6 +1319,30 @@ async def store_voice_assistant(websocket: WebSocket, store_id: str):
         await websocket.send_text(json.dumps({
             'event': 'context_loaded', 'data': context_summary
         }))
+        
+        # Only send greeting if not sent before
+        if not greeting_sent:
+            greeting_sent = True
+            
+            # Wait a moment for Flutter to be ready to receive audio
+            await asyncio.sleep(0.1)
+            
+            # Send greeting message with audio
+            greeting_text = "नमस्ते सर! मैं आपका AI assistant हूं। Inventory update, sales check, या कुछ भी पूछिए।"
+            await websocket.send_text(json.dumps({
+                'event': 'transcript',
+                'text': greeting_text,
+                'is_user': False
+            }))
+            
+            # Generate and send Sarvam TTS audio for greeting
+            pcm_audio = await generate_sarvam_tts(greeting_text)
+            if pcm_audio:
+                logger.info(f"Sending greeting audio ({len(pcm_audio)} bytes)")
+                await websocket.send_bytes(pcm_audio)
+            else:
+                logger.warning("Failed to generate greeting audio")
+            
     except Exception as e:
         logger.error(f"Error loading store context: {str(e)}")
     
@@ -1334,8 +1359,12 @@ async def store_voice_assistant(websocket: WebSocket, store_id: str):
     
     response_task = asyncio.create_task(process_responses())
     
+    # NOTE: We DON'T send inventory context to Nova Sonic to avoid "Chat history over max limit" error
+    # Nova Sonic is only used for STT/TTS, not for understanding inventory queries
+    # All inventory queries are handled directly in the text_query handler below
+    
     async def forward_responses():
-        """Forward responses to frontend"""
+        """Forward responses to frontend - SUPPRESS Nova Sonic AI responses"""
         try:
             while True:
                 response = await response_queue.get()
@@ -1343,21 +1372,88 @@ async def store_voice_assistant(websocket: WebSocket, store_id: str):
                     break
                 
                 if response['type'] == 'audio_output':
-                    # Skip Nova Sonic's audio - we'll use Sarvam TTS instead
+                    # Skip Nova Sonic's audio - we use Sarvam TTS instead
                     pass
                 elif response['type'] in ('transcript', 'transcription'):
-                    # Send transcript to frontend
-                    await websocket.send_text(json.dumps({
-                        'event': 'transcript',
-                        'text': response['text'],
-                        'is_user': response.get('is_user', False)
-                    }))
+                    is_user = response.get('is_user', False)
                     
-                    # Generate high-quality Hindi TTS for AI responses
-                    if not response.get('is_user', False):
-                        pcm_audio = await generate_sarvam_tts(response['text'])
+                    if is_user:
+                        # User spoke - transliterate Hindi to English and process
+                        text = response['text']
+                        text_transliterated = transliterate_hindi_to_english(text)
+                        
+                        # Send transliterated transcript to frontend
+                        await websocket.send_text(json.dumps({
+                            'event': 'transcript',
+                            'text': text_transliterated,
+                            'is_user': True
+                        }))
+                        
+                        # Process the query directly (like text_query handler)
+                        logger.info(f"Processing voice query: {text_transliterated}")
+                        
+                        from app.db.mongodb import get_database
+                        db = await get_database()
+                        
+                        response_text = ""
+                        query_lower = text_transliterated.lower()
+                        
+                        # Handle different query types
+                        if 'stock' in query_lower or 'inventory' in query_lower:
+                            products = await db.products.find({'store_id': store_id}).to_list(length=1000)
+                            total_products = len(products)
+                            in_stock = sum(1 for p in products if p.get('stock_quantity', p.get('stock', 0)) > 0)
+                            low_stock = sum(1 for p in products if 0 < p.get('stock_quantity', p.get('stock', 0)) < 10)
+                            response_text = f"Sir, aapke paas {total_products} products hain. {in_stock} items stock mein hain, aur {low_stock} items kam stock mein hain."
+                            
+                        elif 'sales' in query_lower or 'sell' in query_lower or 'order' in query_lower:
+                            from datetime import datetime, timedelta
+                            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                            orders = await db.orders.find({
+                                'store_id': store_id,
+                                'created_at': {'$gte': today_start}
+                            }).to_list(length=1000)
+                            
+                            total_sales = sum(order.get('total_amount', 0) for order in orders)
+                            order_count = len(orders)
+                            response_text = f"Sir, aaj ki sales {int(total_sales)} rupees hai, total {order_count} orders hain."
+                            
+                        elif 'add' in query_lower and 'stock' in query_lower:
+                            response_text = "Sir, stock add karne ke liye product ka naam aur quantity bataiye."
+                            
+                        elif 'low' in query_lower or 'kam' in query_lower:
+                            products = await db.products.find({
+                                'store_id': store_id,
+                                '$or': [
+                                    {'stock': {'$lt': 10, '$gt': 0}},
+                                    {'stock_quantity': {'$lt': 10, '$gt': 0}}
+                                ]
+                            }).to_list(length=10)
+                            
+                            if products:
+                                product_names = [p.get('name', 'Unknown') for p in products[:5]]
+                                response_text = f"Sir, ye items kam stock mein hain: {', '.join(product_names)}"
+                            else:
+                                response_text = "Sir, sab items sufficient stock mein hain."
+                        else:
+                            response_text = "Sir, main aapki madad kar sakta hoon. Stock check, sales report, ya low stock items ke baare mein poochiye."
+                        
+                        # Send AI response
+                        await websocket.send_text(json.dumps({
+                            'event': 'transcript',
+                            'text': response_text,
+                            'is_user': False
+                        }))
+                        
+                        # Generate and send TTS audio
+                        pcm_audio = await generate_sarvam_tts(response_text)
                         if pcm_audio:
                             await websocket.send_bytes(pcm_audio)
+                        
+                        logger.info(f"Sent response: {response_text[:100]}...")
+                    else:
+                        # Nova Sonic AI response - SUPPRESS IT
+                        logger.info(f"🔇 Suppressed Nova Sonic AI response: {response['text'][:100]}...")
         except Exception as e:
             logger.error(f"Response forwarding error: {e}")
     
@@ -1389,14 +1485,78 @@ async def store_voice_assistant(websocket: WebSocket, store_id: str):
                         # Handle text query from quick action buttons
                         query_text = message.get('text', '')
                         if query_text:
-                            # Inject text query as instruction to Nova Sonic
-                            await nova_sonic.inject_instruction(session_id, query_text)
-                            # Echo user query to frontend
+                            logger.info(f"Processing text query: {query_text}")
+                            
+                            # Echo user query to frontend first
                             await websocket.send_text(json.dumps({
                                 'event': 'transcript',
                                 'text': query_text,
                                 'is_user': True
                             }))
+                            
+                            # Process the query and generate response
+                            from app.db.mongodb import get_database
+                            db = await get_database()
+                            
+                            response_text = ""
+                            
+                            # Handle different query types
+                            if 'stock' in query_text.lower() or 'inventory' in query_text.lower():
+                                # Get inventory summary
+                                products = await db.products.find({'store_id': store_id}).to_list(length=1000)
+                                total_products = len(products)
+                                # Check both 'stock' and 'stock_quantity' fields
+                                in_stock = sum(1 for p in products if p.get('stock_quantity', p.get('stock', 0)) > 0)
+                                low_stock = sum(1 for p in products if 0 < p.get('stock_quantity', p.get('stock', 0)) < 10)
+                                response_text = f"Sir, aapke paas {total_products} products hain. {in_stock} items stock mein hain, aur {low_stock} items kam stock mein hain."
+                                
+                            elif 'sales' in query_text.lower():
+                                # Get today's sales
+                                from datetime import datetime, timedelta
+                                today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                                orders = await db.orders.find({
+                                    'store_id': store_id,
+                                    'created_at': {'$gte': today_start}
+                                }).to_list(length=1000)
+                                
+                                total_sales = sum(order.get('total_amount', 0) for order in orders)
+                                order_count = len(orders)
+                                response_text = f"Sir, aaj ki sales {int(total_sales)} rupees hai, total {order_count} orders hain."
+                                
+                            elif 'add' in query_text.lower() and 'stock' in query_text.lower():
+                                response_text = "Sir, stock add karne ke liye product ka naam aur quantity bataiye."
+                                
+                            elif 'low' in query_text.lower() or 'kam' in query_text.lower():
+                                # Get low stock items - check both field names
+                                products = await db.products.find({
+                                    'store_id': store_id,
+                                    '$or': [
+                                        {'stock': {'$lt': 10, '$gt': 0}},
+                                        {'stock_quantity': {'$lt': 10, '$gt': 0}}
+                                    ]
+                                }).to_list(length=10)
+                                
+                                if products:
+                                    product_names = [p.get('name', 'Unknown') for p in products[:5]]
+                                    response_text = f"Sir, ye items kam stock mein hain: {', '.join(product_names)}"
+                                else:
+                                    response_text = "Sir, sab items sufficient stock mein hain."
+                            else:
+                                response_text = "Sir, main aapki madad kar sakta hoon. Stock check, sales report, ya low stock items ke baare mein poochiye."
+                            
+                            # Send AI response
+                            await websocket.send_text(json.dumps({
+                                'event': 'transcript',
+                                'text': response_text,
+                                'is_user': False
+                            }))
+                            
+                            # Generate and send TTS audio
+                            pcm_audio = await generate_sarvam_tts(response_text)
+                            if pcm_audio:
+                                await websocket.send_bytes(pcm_audio)
+                            
+                            logger.info(f"Sent response: {response_text[:100]}...")
                 except json.JSONDecodeError:
                     pass
                     

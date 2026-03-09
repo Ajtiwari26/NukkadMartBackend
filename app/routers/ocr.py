@@ -289,6 +289,7 @@ async def upload_and_match(
     file: UploadFile = File(...),
     store_id: str = Query(..., description="Store ID for product matching"),
     wait_for_result: bool = Query(False, description="Wait for OCR to complete (sync mode)"),
+    is_demo: bool = Query(False, description="Whether user is in demo mode"),
     service: OCRService = Depends(get_ocr_service)
 ):
     """
@@ -326,7 +327,7 @@ async def upload_and_match(
         await service.process_job(job_id)
 
         # Get matched cart
-        cart_result = await service.get_matched_cart(job_id, store_id)
+        cart_result = await service.get_matched_cart(job_id, store_id, is_demo=is_demo)
 
         if "error" in cart_result:
             raise HTTPException(status_code=500, detail=cart_result["error"])

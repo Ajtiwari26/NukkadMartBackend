@@ -212,7 +212,8 @@ class OCRService:
     async def get_matched_cart(
         self,
         job_id: str,
-        store_id: str
+        store_id: str,
+        is_demo: bool = False
     ) -> Dict[str, Any]:
         """
         Get OCR results matched to store products.
@@ -241,7 +242,8 @@ class OCRService:
         inventory_service = InventoryService(self.db)
         match_result = await inventory_service.match_smart_cart(
             store_id,
-            items
+            items,
+            is_demo=is_demo  # Pass demo mode flag
         )
 
         return {
