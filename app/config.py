@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # CORS - comma-separated string that gets parsed to list
-    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173,http://localhost:8000,http://127.0.0.1:8000,https://*.vercel.app,https://nukkadmartweb.vercel.app"
 
     # Rate Limiting
     RATE_LIMIT_REQUESTS: int = 100
