@@ -1288,3 +1288,135 @@ async def customer_voice_assistant(
             await websocket.close()
         except Exception:
             pass
+
+
+@router.websocket("/ws/voice/store/{store_id}")
+async def store_voice_assistant(websocket: WebSocket, store_id: str):
+    """Voice assistant for NukkadStore owners - Inventory management and business insights"""
+    await websocket.accept()
+    logger.info(f"Store voice session started for store: {store_id}")
+    
+    nova_sonic = NovaSonicService()
+    context_service = VoiceContextService()
+    
+    # Create session with store management persona and tools
+    session = await nova_sonic.create_session(
+        user_id=store_id,
+        persona="personal_manager",
+        tools=["get_sales_report", "get_inventory_status", "get_low_stock_alerts",
+               "suggest_pricing", "forecast_demand", "get_revenue_analytics",
+               "get_top_products", "get_daily_summary"]
+    )
+    
+    session_id = session['id']
+    
+    # Initialize store context (inventory, sales data, etc.)
+    try:
+        context_summary = await context_service.initialize_store_context(
+            session_id=session_id, store_id=store_id
+        )
+        await websocket.send_text(json.dumps({
+            'event': 'context_loaded', 'data': context_summary
+        }))
+    except Exception as e:
+        logger.error(f"Error loading store context: {str(e)}")
+    
+    response_queue = asyncio.Queue()
+    
+    async def process_responses():
+        """Process responses from Nova Sonic"""
+        try:
+            async for response in nova_sonic.receive_responses(session_id):
+                await response_queue.put(response)
+        except Exception as e:
+            logger.error(f"Response processing error: {e}")
+            await response_queue.put(None)
+    
+    response_task = asyncio.create_task(process_responses())
+    
+    async def forward_responses():
+        """Forward responses to frontend"""
+        try:
+            while True:
+                response = await response_queue.get()
+                if response is None:
+                    break
+                
+                if response['type'] == 'audio_output':
+                    # Skip Nova Sonic's audio - we'll use Sarvam TTS instead
+                    pass
+                elif response['type'] in ('transcript', 'transcription'):
+                    # Send transcript to frontend
+                    await websocket.send_text(json.dumps({
+                        'event': 'transcript',
+                        'text': response['text'],
+                        'is_user': response.get('is_user', False)
+                    }))
+                    
+                    # Generate high-quality Hindi TTS for AI responses
+                    if not response.get('is_user', False):
+                        pcm_audio = await generate_sarvam_tts(response['text'])
+                        if pcm_audio:
+                            await websocket.send_bytes(pcm_audio)
+        except Exception as e:
+            logger.error(f"Response forwarding error: {e}")
+    
+    forward_task = asyncio.create_task(forward_responses())
+    audio_started = False
+    
+    try:
+        while True:
+            data = await websocket.receive()
+            
+            if 'bytes' in data:
+                # Audio chunk from store owner
+                if not audio_started:
+                    await nova_sonic.start_audio_input(session_id)
+                    audio_started = True
+                await nova_sonic.send_audio_chunk(session_id, data['bytes'])
+                
+            elif 'text' in data:
+                # Control messages
+                try:
+                    message = json.loads(data['text'])
+                    if message.get('event') == 'end_audio' and audio_started:
+                        await nova_sonic.end_audio_input(session_id)
+                        audio_started = False
+                    elif message.get('event') == 'start_audio' and not audio_started:
+                        await nova_sonic.start_audio_input(session_id)
+                        audio_started = True
+                    elif message.get('event') == 'text_query':
+                        # Handle text query from quick action buttons
+                        query_text = message.get('text', '')
+                        if query_text:
+                            # Inject text query as instruction to Nova Sonic
+                            await nova_sonic.inject_instruction(session_id, query_text)
+                            # Echo user query to frontend
+                            await websocket.send_text(json.dumps({
+                                'event': 'transcript',
+                                'text': query_text,
+                                'is_user': True
+                            }))
+                except json.JSONDecodeError:
+                    pass
+                    
+    except WebSocketDisconnect:
+        logger.info(f"Store voice session ended for store: {store_id}")
+    except Exception as e:
+        logger.error(f"Error in store voice session: {str(e)}")
+    finally:
+        if audio_started:
+            try:
+                await nova_sonic.end_audio_input(session_id)
+            except Exception:
+                pass
+        
+        response_task.cancel()
+        forward_task.cancel()
+        await nova_sonic.close_session(session_id)
+        await context_service.cleanup_context(session_id)
+        
+        try:
+            await websocket.close()
+        except Exception:
+            pass
