@@ -64,22 +64,59 @@ PRODUCT_ALIASES = {
 GENERIC_WORDS = {'packet', 'pack', 'box', 'bottle', 'bag', 'piece', 'kg', 'gm', 'ml', 'ltr',
                  'powder', 'masala', 'mix', 'small', 'big', 'large', 'medium', 'premium'}
 
+# Intent / concept → product keyword mapping
+# Bridges the gap when LLM searches by problem/need rather than product name
+INTENT_ALIASES = {
+    # Stain & cleaning
+    'stain remover': ['surf excel', 'vanish', 'detergent', 'liquid detergent'],
+    'stain': ['surf excel', 'vanish', 'detergent'],
+    'cleaning': ['vim', 'harpic', 'colin', 'surf excel', 'detergent'],
+    'daag': ['surf excel', 'vanish', 'detergent'],      # Hindi: stain
+    'saaf': ['surf excel', 'vim', 'detergent'],          # Hindi: clean
+    # Breakfast
+    'breakfast': ['bread', 'butter', 'jam', 'cornflakes', 'oats', 'milk', 'eggs'],
+    'nashta': ['bread', 'butter', 'biscuits', 'cornflakes', 'milk'],  # Hindi: breakfast
+    # Tea / chai
+    'chai ingredients': ['tea', 'sugar', 'milk', 'elaichi'],
+    'chai banane': ['tea', 'sugar', 'milk'],
+    # Common cooking needs
+    'tadka': ['ghee', 'oil', 'jeera', 'mustard seeds', 'onion', 'garlic'],
+    'roti ingredients': ['atta', 'salt', 'oil'],
+    'dal ingredients': ['dal', 'salt', 'oil', 'onion', 'tomato', 'garlic'],
+    # Pav Bhaji (example from vision)
+    'pav bhaji': ['pav', 'pav bhaji masala', 'butter', 'potato', 'onion', 'tomato'],
+    # Health
+    'cold flu': ['turmeric', 'ginger', 'honey', 'lemon'],
+    'fever': ['paracetamol', 'ginger', 'turmeric', 'lemon'],
+}
+
 
 def resolve_aliases(query: str) -> List[str]:
-    """Expand a query with multilingual aliases. Returns list of candidate search strings."""
+    """Expand a query with multilingual and intent-based aliases. Returns list of candidate search strings."""
     names = [query.lower()]
     q_lower = query.lower().strip()
     
-    # Full phrase alias
+    # Full phrase alias (product name)
     if q_lower in PRODUCT_ALIASES:
         names.append(PRODUCT_ALIASES[q_lower])
     
-    # Per-word alias
+    # Per-word alias (product name)
     for word in q_lower.split():
         if word in PRODUCT_ALIASES:
             names.append(PRODUCT_ALIASES[word])
     
+    # Intent / concept alias — expands to list of product keywords
+    if q_lower in INTENT_ALIASES:
+        names.extend(INTENT_ALIASES[q_lower])
+    
+    # Partial phrase match for intent aliases
+    for intent_phrase, product_keywords in INTENT_ALIASES.items():
+        if intent_phrase in q_lower or q_lower in intent_phrase:
+            names.extend(product_keywords)
+            break  # Only match the first intent phrase to avoid over-expansion
+    
     return list(set(names))
+
 
 
 def keyword_score(query: str, product_name: str, all_product_names: List[str]) -> float:

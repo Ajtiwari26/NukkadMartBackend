@@ -468,14 +468,45 @@ class InventoryService:
             raw_text = item.get("raw_text", "")
             search_term = item.get("search_term_english")
             
-            # 1. Handle Unreadable
-            if item.get("is_unreadable", False) or not search_term:
+            # 1. Handle Unreadable / Missing search term
+            if item.get("is_unreadable", False) and not search_term:
+                # Truly illegible: skip
                 unmatched.append({
                     "raw_text": raw_text,
                     "reason": "unreadable",
                     "confidence": item.get("confidence_score", 0)
                 })
                 continue
+            
+            # Fallback: if search_term_english is null but raw_text is non-empty,
+            # try resolving via PRODUCT_ALIASES (handles leftover Hindi that wasn't translated)
+            if not search_term and raw_text:
+                try:
+                    from app.services.search_service import resolve_aliases, PRODUCT_ALIASES
+                    raw_lower = raw_text.lower().strip()
+                    # Direct alias lookup
+                    if raw_lower in PRODUCT_ALIASES:
+                        search_term = PRODUCT_ALIASES[raw_lower]
+                        logger.info(f"🔤 Hindi fallback: '{raw_text}' → '{search_term}' via alias map")
+                    else:
+                        # Try per-word match
+                        for word in raw_lower.split():
+                            if word in PRODUCT_ALIASES:
+                                search_term = PRODUCT_ALIASES[word]
+                                logger.info(f"🔤 Hindi fallback (word): '{word}' → '{search_term}'")
+                                break
+                except Exception:
+                    pass
+            
+            # If still no search term after fallback, mark unmatched
+            if not search_term:
+                unmatched.append({
+                    "raw_text": raw_text,
+                    "reason": "unreadable",
+                    "confidence": item.get("confidence_score", 0)
+                })
+                continue
+
 
             req_qty = float(item.get("req_qty", 1))
             req_unit = item.get("req_unit", "piece").lower()

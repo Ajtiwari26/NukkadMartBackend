@@ -1,11 +1,16 @@
 """
 Voice Assistant Router - SYNCHRONOUS VERSION (No Race Conditions)
 Groq classifies intent → Inject to Nova Sonic → Nova Sonic responds
+
+Agent path (new): complex queries → AgentOrchestrator (Bedrock function calling)
+Fast path (existing): simple add/update/remove → IntentClassifier state machine
 """
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from app.services.nova_sonic_service import NovaSonicService
 from app.services.voice_context_service import VoiceContextService
 from app.services.intent_classifier import IntentClassifier
+from app.services.agent_orchestrator import get_agent_orchestrator, should_use_agent
+from app.services.agent_tools import AgentToolExecutor
 from app.db.redis import RedisClient
 import json
 import asyncio
@@ -444,6 +449,116 @@ async def customer_voice_assistant(
                                 shared_state['processing'] = False
                                 continue
                             
+                            # === AGENT PATH: Complex / reasoning queries ===
+                            if await should_use_agent(text):
+                                logger.info(f"🤖 Agent path triggered for: '{text}'")
+                                
+                                # ⚡ Speak acknowledgement IMMEDIATELY to mask Bedrock+TTS latency
+                                ack_msg = "Ek second ji, dekh raha hoon..."
+                                ack_pcm = await generate_sarvam_tts(ack_msg)
+                                
+                                # Send 'processing' event to MUTE the microphone on Flutter side while thinking
+                                await websocket.send_text(json.dumps({'event': 'processing'}))
+                                
+                                await websocket.send_text(json.dumps({'event': 'transcript', 'text': ack_msg, 'is_user': False}))
+                                if ack_pcm: await websocket.send_bytes(ack_pcm)
+                                
+                                try:
+                                    tool_executor = AgentToolExecutor(
+                                        context_products=context_products,
+                                        session_cart=session_cart,
+                                        session_id=session_id,
+                                        current_store_id=current_store_id,
+                                    )
+                                    orchestrator = get_agent_orchestrator()
+                                    agent_response = await orchestrator.process_query(
+                                        user_text=text,
+                                        tool_executor=tool_executor,
+                                    )
+                                    
+                                    # 1. Unmute mic on Flutter side by sending processing=False
+                                    await websocket.send_text(json.dumps({'event': 'processing', 'status': False}))
+                                    
+                                    # 2. Speak the friendly message via TTS
+                                    pcm = await generate_sarvam_tts(agent_response.message)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': agent_response.message, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+                                    
+                                    # 2. Show items in existing product_selection panel (reusing current UI)
+                                    if agent_response.suggested_items:
+                                        # Enrich items: find full product dicts from context for proper cart integration
+                                        enriched_products = []
+                                        for item in agent_response.suggested_items:
+                                            matched = None
+                                            for p in context_products:
+                                                pid = str(p.get('id', p.get('_id', '')))
+                                                if pid == str(item.item_id):
+                                                    matched = p
+                                                    break
+                                            if not matched:
+                                                # Build minimal fallback from agent data
+                                                matched = {
+                                                    'id': item.item_id,
+                                                    '_id': item.item_id,
+                                                    'name': item.name,
+                                                    'brand': item.brand or '',
+                                                    'price': item.price,
+                                                    'weight': item.unit or '',
+                                                    'store_id': item.shop_id,
+                                                    'store_name': item.store_name or '',
+                                                    'stock': item.stock or 99,
+                                                    'category': item.category or 'General',
+                                                }
+                                            enriched_products.append(matched)
+                                        
+                                        # Push into AWAITING_SELECTION so existing tap-to-add flow works
+                                        shared_state['state'] = ConversationState.AWAITING_SELECTION
+                                        shared_state['pending'] = {
+                                            'action': 'add',
+                                            'products': enriched_products,
+                                            'quantity': 1.0,
+                                            'source_store_id': current_store_id,
+                                        }
+                                        
+                                        # Build options in existing product_selection event format
+                                        options = []
+                                        for prod in enriched_products[:8]:
+                                            prod_id = _get_prod_id(prod)
+                                            options.append({
+                                                'product_id': prod_id,
+                                                'name': prod.get('name', ''),
+                                                'brand': prod.get('brand', ''),
+                                                'price': prod.get('price', 0),
+                                                'unit': prod.get('weight', prod.get('unit', '')),
+                                                'in_cart': int(session_cart.get(prod_id, 0)),
+                                                'store_id': prod.get('store_id', ''),
+                                            })
+                                        
+                                        await websocket.send_text(json.dumps({
+                                            'event': 'product_selection',
+                                            'product_name': 'Suggestions',
+                                            'action': 'add',
+                                            'quantity': 1,
+                                            'options': options,
+                                            'agent_message': agent_response.message,
+                                            'action_required': agent_response.action_required,
+                                        }))
+                                        logger.info(f"🛒 Agent: sent {len(options)} items to product_selection panel")
+                                    else:
+                                        logger.info("🤖 Agent: info-only response, no items to show")
+                                
+                                except Exception as agent_err:
+                                    logger.error(f"Agent orchestrator error: {agent_err}")
+                                    # Graceful fallback — tell user to say product name directly
+                                    msg = "Sir, thodi si takleef hui. Seedha product ka naam bataiye."
+                                    pcm = await generate_sarvam_tts(msg)
+                                    await websocket.send_text(json.dumps({'event': 'transcript', 'text': msg, 'is_user': False}))
+                                    if pcm: await websocket.send_bytes(pcm)
+                                
+                                shared_state['processing'] = False
+                                continue
+                            
+                            # === FAST PATH: Existing state-machine intent classifier ===
                             # 1. Classify New Intent
                             user_intent = await intent_classifier.classify_user_intent(
                                 text, context_products, session_cart, shared_state.get('last_product_name')

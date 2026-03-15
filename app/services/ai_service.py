@@ -21,6 +21,7 @@ class AIService:
     def __init__(self):
         self.groq_client = None
         self.groq_api_key = settings.GROQ_API_KEY
+        self._groq_key_valid = True  # Set to False after a 401 to skip Groq permanently
         self._initialize_client()
 
     def _initialize_client(self):
@@ -28,11 +29,11 @@ class AIService:
         if self.groq_api_key:
             logger.info("Groq API key found, using Groq for AI services")
         else:
-            logger.warning("No Groq API key found. Using mock responses.")
+            logger.warning("No Groq API key found. Will use Bedrock directly.")
 
     def is_available(self) -> bool:
-        """Check if AI service is available"""
-        return bool(self.groq_api_key)
+        """Check if Groq AI service is available and key is valid"""
+        return bool(self.groq_api_key) and self._groq_key_valid
 
     # ==================== OCR with Groq Vision ====================
 
@@ -65,195 +66,377 @@ class AIService:
 
         # Prepare the prompt for Groq Vision
         # Prepare the prompt for Groq Vision with strict JSON output
-        prompt = """You are an expert AI assistant for an Indian grocery store (kirana shop). Your task is to extract product items from a handwritten shopping list image.
+        prompt = """You are an expert OCR assistant for an Indian grocery store (kirana shop). Your task is to extract product items from a handwritten shopping list image.
+
+CRITICAL: The shopping list may be written in HINDI (Devanagari script), ENGLISH, or a MIX of both. You MUST read and understand Hindi text perfectly.
+
+HINDI READING INSTRUCTIONS:
+- Read Devanagari script characters carefully and accurately
+- Translate Hindi product names to English in the `search_term_english` field
+- Do NOT mark Hindi text as unreadable just because it is in a different script
+- Common Hindi grocery words: दूध=Milk, चावल=Rice, आटा=Flour/Atta, दाल=Lentils, तेल=Oil, चाय=Tea, नमक=Salt, चीनी=Sugar, घी=Ghee, दही=Curd, पनीर=Paneer, प्याज=Onion, आलू=Potato, टमाटर=Tomato, मिर्च=Chilli
 
 IMPORTANT: This is an Indian grocery shopping list. Common items include:
 - Rice varieties: Basmati Rice, Regular Rice, Sona Masoori
-- Beverages: Bisleri Water, Coca Cola, Pepsi, Tea, Coffee
-- Staples: Atta (wheat flour), Maida, Sugar, Salt, Oil
-- Pulses: Dal, Moong Dal, Toor Dal, Chana Dal
-- Spices: Turmeric, Red Chili, Coriander
-- Dairy: Milk, Paneer, Curd, Butter, Ghee
+- Beverages: Bisleri Water, Coca Cola, Pepsi, Tea (चाय), Coffee
+- Staples: Atta (आटा), Maida, Sugar (चीनी), Salt (नमक), Oil (तेल)
+- Pulses: Dal (दाल), Moong Dal, Toor Dal, Chana Dal
+- Spices: Turmeric (हल्दी), Red Chili (लाल मिर्च), Coriander (धनिया)
+- Dairy: Milk (दूध), Paneer (पनीर), Curd (दही), Butter, Ghee (घी)
 - Snacks: Biscuits, Namkeen, Chips
 
 READ CAREFULLY - Common handwriting mistakes to avoid:
 - "Basmati" should NOT be read as "Biscuit" or "Biskuit"
-- "Bisleri" should NOT be read as "Biscuit" or "Biskuit"  
-- "Rice" should NOT be confused with other words
-- Pay attention to word length and letter shapes
+- "Bisleri" should NOT be read as "Biscuit" or "Biskuit"
+- Hindi script letters are VALID text, NOT illegible scribbles
 
-Analyze the image and extract every item listed. For each item, return a JSON object with the following fields:
+For each item, return a JSON object with these fields:
+- `raw_text`: The EXACT text written (keep Hindi as-is, e.g., "दाल-5")
+- `search_term_english`: English translation/transliteration for product search. For Hindi text like "दाल" → "Lentils" or "Dal". For "चावल" → "Rice". NEVER set to null for readable Hindi text.
+- `req_qty`: Numeric quantity (e.g., 2, 5). If written as "दाल-5", the qty is 5. Default to 1 if not specified.
+- `req_unit`: Unit of measurement (e.g., "gm", "kg", "ml", "L", "piece"). Default to "piece".
+- `price`: Price of the item if written (e.g., ₹50), use numeric value only. Default to 0 if not specified.
+- `is_brand_specified`: Boolean, true if a specific brand is mentioned.
+- `confidence_score`: 0 to 1. Hindi text you can read = 0.85+. Mixed/unclear text = 0.5-0.8. Only truly illegible = < 0.4.
+- `is_unreadable`: Boolean. Set to true ONLY if the text is completely illegible (random scribbles, ink blobs). DO NOT set to true for readable Hindi/Devanagari text.
 
-- `raw_text`: The exact text written for this item (e.g., "Basmati Rice", "Bisleri Water").
-- `search_term_english`: The English translation of the product name for searching (e.g., "Basmati Rice", "Bisleri Water"). If unreadable, set to null.
-- `req_qty`: The numeric quantity requested (e.g., 200, 1). If not specified, default to 1.
-- `req_unit`: The unit of measurement (e.g., "gm", "kg", "ml", "L", "piece"). If not specified, default to "piece".
-- `is_brand_specified`: Boolean, true if a specific brand is mentioned (e.g., "Bisleri", "India Gate").
-- `confidence_score`: A number between 0 and 1 indicating how confident you are in reading this item.
-- `is_unreadable`: Boolean, set to true if the text is illegible or confidence is low (< 0.5).
+Return a strictly valid JSON array. No markdown, no code blocks, just the raw JSON array.
 
-Return the result as a strictly valid JSON array of objects. Do not include any markdown formatting, code blocks, or explanations. Just the raw JSON array.
-
-Example Output:
+Example with Hindi input (दूध-2, दाल-5):
 [
   {
-    "raw_text": "Basmati Rice", 
+    "raw_text": "दूध-2",
+    "search_term_english": "Milk",
+    "req_qty": 2,
+    "req_unit": "piece",
+    "is_brand_specified": false,
+    "confidence_score": 0.90,
+    "is_unreadable": false
+  },
+  {
+    "raw_text": "दाल-5",
+    "search_term_english": "Lentils",
+    "req_qty": 5,
+    "req_unit": "piece",
+    "is_brand_specified": false,
+    "confidence_score": 0.90,
+    "is_unreadable": false
+  }
+]
+
+Example with English input:
+[
+  {
+    "raw_text": "Basmati Rice",
     "search_term_english": "Basmati Rice",
     "req_qty": 1,
     "req_unit": "kg",
     "is_brand_specified": false,
     "confidence_score": 0.95,
     "is_unreadable": false
-  },
-  {
-    "raw_text": "Bisleri Water", 
-    "search_term_english": "Bisleri Water",
-    "req_qty": 1,
-    "req_unit": "L",
-    "is_brand_specified": true,
-    "confidence_score": 0.90,
-    "is_unreadable": false
   }
 ]"""
 
-        # Check if Bedrock is configured
-        if not settings.AWS_REGION:
-            logger.error("AWS_REGION not configured for Bedrock OCR")
-            return {
-                "success": False,
-                "raw_text": "",
-                "error": "AWS Bedrock not configured"
-            }
-                
-        # Prepare image data for Bedrock
-        import boto3
-        try:
-            # Use region from settings, fallback to ap-south-1
-            region = settings.AWS_REGION or "ap-south-1"
-            
-            # Determine Nova Pro model - use India region for better latency
-            model_id = "apac.amazon.nova-pro-v1:0"  # India region model
-            if hasattr(settings, "BEDROCK_MODEL_ID") and getattr(settings, "BEDROCK_MODEL_ID"):
-                model_id = getattr(settings, "BEDROCK_MODEL_ID")
-            elif hasattr(settings, "BEDROCK_NOVA_PRO_MODEL_ID") and getattr(settings, "BEDROCK_NOVA_PRO_MODEL_ID"):
-                model_id = getattr(settings, "BEDROCK_NOVA_PRO_MODEL_ID")
-                
-            client_kwargs = {"region_name": region}
-            if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
-                client_kwargs["aws_access_key_id"] = settings.AWS_ACCESS_KEY_ID
-                client_kwargs["aws_secret_access_key"] = settings.AWS_SECRET_ACCESS_KEY
-            
-            bedrock_client = boto3.client("bedrock-runtime", **client_kwargs)
-            
-            logger.info(f"Calling Bedrock Converse API for OCR with model: {model_id} in {region}")
-            
-            # Create the message for Converse API with strict JSON instructions
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "image": {
-                                "format": image_format if image_format in ["png", "jpeg", "webp", "gif"] else "jpeg",
-                                "source": {
-                                    "bytes": image_data
-                                }
+        # 1. Try Groq Vision if available
+        if self.is_available():
+            try:
+                # Encode image to base64
+                image_base64 = base64.b64encode(image_data).decode("utf-8")
+                media_type = f"image/{image_format}"
+                if image_format == "jpg":
+                    media_type = "image/jpeg"
+
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    payload = {
+                        "model": settings.GROQ_VISION_MODEL,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": "You are a JSON-only OCR extraction API. You MUST respond with ONLY a valid JSON array of items. No explanations, no markdown, no commentary, no text before or after the JSON array. Start your response directly with the opening bracket of the array."
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:{media_type};base64,{image_base64}"
+                                        }
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": prompt
+                                    }
+                                ]
                             }
-                        },
-                        {
-                            "text": prompt
-                        }
-                    ]
-                }
-            ]
-            
-            # Call Nova Pro using Converse API in an async executor
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: bedrock_client.converse(
-                    modelId=model_id,
-                    messages=messages,
-                    inferenceConfig={
-                        "maxTokens": 2048,
-                        "temperature": 0.0  # Set to 0 for deterministic OCR results
+                        ],
+                        "max_tokens": 2048,
+                        "temperature": 0.0
                     }
-                )
-            )
-            
-            # Extract text content from Converse response
-            content = ""
-            output_message = response.get("output", {}).get("message", {})
-            for block in output_message.get("content", []):
-                if "text" in block:
-                    content += block["text"]
                     
-            if not content:
-                logger.warning("Bedrock returned empty content")
+                    logger.info(f"Calling Groq Vision API with model: {settings.GROQ_VISION_MODEL}")
+                    
+                    response = await client.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self.groq_api_key}",
+                            "Content-Type": "application/json"
+                        },
+                        json=payload
+                    )
+
+                    if response.status_code == 200:
+                        result = response.json()
+                        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        if content:
+                            logger.info(f"Successfully extracted OCR text via Groq: {content[:100]}...")
+                            return self._parse_ocr_json(content)
+                    elif response.status_code == 401:
+                        logger.error("Groq API key is invalid (401).")
+                        return {
+                            "success": False,
+                            "raw_text": "",
+                            "error": "Groq API key is invalid"
+                        }
+                    else:
+                        logger.error(f"Groq API non-200 response ({response.status_code}): {response.text}")
+                        return {
+                            "success": False,
+                            "raw_text": "",
+                            "error": f"Groq execution failed with status {response.status_code}"
+                        }
+                        
+            except Exception as e:
+                logger.error(f"Groq OCR failed: {e}")
                 return {
                     "success": False,
                     "raw_text": "",
-                    "error": "No text extracted from image"
+                    "error": str(e)
                 }
-
-            logger.info(f"Successfully extracted OCR text via Nova Pro: {content[:100]}...")
-
-            # Parse the text into structured items
-            try:
-                # Clean up content if it contains markdown code blocks
-                content = content.strip()
-                if content.startswith("```json"):
-                    content = content[7:]
-                if content.startswith("```"):
-                    content = content[3:]
-                if content.endswith("```"):
-                    content = content[:-3]
-                content = content.strip()
-                
-                items = json.loads(content)
-                
-                # Validate items structure
-                validated_items = []
-                for item in items:
-                    if isinstance(item, dict):
-                        validated_items.append(item)
-                        
-                return {
-                    "success": True,
-                    "raw_text": json.dumps(validated_items, indent=2), # Store JSON representation as raw text for debugging
-                    "items": validated_items,
-                    "confidence": 0.95
-                }
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON response from Nova Pro: {e}")
-                import re
-                # One last attempt to find a JSON array in the text
-                json_match = re.search(r'\[[\s\S]*\]', content)
-                if json_match:
-                    try:
-                        items = json.loads(json_match.group())
-                        return {
-                            "success": True,
-                            "raw_text": json.dumps(items, indent=2),
-                            "items": items,
-                            "confidence": 0.90
-                        }
-                    except Exception:
-                        pass
-                        
-                return {
-                    "success": False,
-                    "raw_text": content,
-                    "error": "Failed to parse AI response",
-                    "items": []
-                }
-
-        except Exception as e:
-            logger.error(f"Bedrock OCR error: {e}")
+        else:
+            logger.error("Groq not available (no API key configured)")
             return {
                 "success": False,
                 "raw_text": "",
-                "error": str(e)
+                "error": "Groq API key not configured"
+            }
+
+    # ==================== Store Inventory OCR ====================
+
+    async def extract_inventory_items(
+        self,
+        image_data: bytes,
+        image_format: str = "jpeg"
+    ) -> Dict[str, Any]:
+        """
+        Extract inventory items (with PRICE and QUANTITY) from a store inventory image.
+        Unlike extract_shopping_list, this focuses on price and stock quantity extraction.
+        """
+        if not self.is_available():
+            return self._mock_ocr_response()
+
+        image_base64 = base64.b64encode(image_data).decode("utf-8")
+        media_type = f"image/{image_format}"
+        if image_format == "jpg":
+            media_type = "image/jpeg"
+
+        prompt = """You are an OCR assistant for a STORE OWNER who wants to add products to their inventory system.
+
+The image contains a LIST of products. Each product likely has:
+- A PRODUCT NAME
+- A PRICE (in ₹ / Rs / rupees). Look for numbers near the item name - these are prices.
+- A QUANTITY / STOCK COUNT. Look for numbers indicating how many units.
+- Sometimes a WEIGHT or UNIT (kg, g, ml, L, piece, packet, etc.)
+
+CRITICAL INSTRUCTIONS:
+- You MUST extract the PRICE for each item. Look for ₹ signs, "Rs", or any number written next to the product name that represents cost. Prices are usually numbers like 30, 50, 120, 250, etc.
+- You MUST extract the QUANTITY for each item. This is how many units are in stock. Could be written as "x2", "qty: 5", just a number, etc.
+- If the weight is part of the product description (e.g. "Rice 5kg"), that is NOT the quantity. The quantity is how many packets/units.
+- Read Hindi/Devanagari text if present and translate to English.
+
+For each item, return a JSON object with:
+- `name`: Product name in English
+- `raw_text`: Exact text as written in the image
+- `price`: Price as a NUMBER (e.g. 50, not "₹50"). Default 0 only if truly not visible.
+- `quantity`: Stock quantity as a NUMBER (e.g. 5). Default 1 only if truly not visible.
+- `unit`: Unit like "kg", "g", "ml", "L", "piece", "packet". Default "piece".
+
+Return ONLY a valid JSON array. No text, no explanation, just the JSON array starting with [
+
+Example:
+[
+  {"name": "Tata Salt", "raw_text": "Tata Salt 1kg - ₹28", "price": 28, "quantity": 1, "unit": "kg"},
+  {"name": "Aashirvaad Atta", "raw_text": "Aashirvaad Atta 5kg x3 ₹250", "price": 250, "quantity": 3, "unit": "piece"},
+  {"name": "Amul Butter", "raw_text": "Amul Butter 100g Rs.52", "price": 52, "quantity": 1, "unit": "piece"}
+]"""
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                payload = {
+                    "model": settings.GROQ_VISION_MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a JSON-only inventory extraction API. Respond with ONLY a JSON array. Extract product name, price, and quantity from the image. Start directly with ["
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:{media_type};base64,{image_base64}"
+                                    }
+                                },
+                                {
+                                    "type": "text",
+                                    "text": prompt
+                                }
+                            ]
+                        }
+                    ],
+                    "max_tokens": 2048,
+                    "temperature": 0.0
+                }
+
+                logger.info("Calling Groq Vision for INVENTORY extraction")
+                response = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.groq_api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json=payload
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if content:
+                        logger.info(f"Inventory OCR response: {content[:200]}...")
+                        return self._parse_inventory_json(content)
+                else:
+                    logger.error(f"Groq API error ({response.status_code}): {response.text}")
+
+        except Exception as e:
+            logger.error(f"Inventory OCR error: {e}")
+
+        return {"success": False, "items": [], "raw_text": ""}
+
+    def _parse_inventory_json(self, content: str) -> Dict[str, Any]:
+        """Parse the inventory extraction JSON response"""
+        import re
+        content = content.strip()
+        # Strip markdown code blocks
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        content = content.strip()
+
+        try:
+            parsed = json.loads(content)
+            items = parsed if isinstance(parsed, list) else parsed.get("items", parsed.get("products", []))
+        except json.JSONDecodeError:
+            # Fallback: find longest JSON array
+            all_arrays = re.findall(r'\[\s*\{[\s\S]*?\}\s*\]', content)
+            if not all_arrays:
+                return {"success": False, "items": [], "raw_text": content}
+            all_arrays.sort(key=len, reverse=True)
+            items = []
+            for arr_str in all_arrays:
+                try:
+                    items = json.loads(arr_str)
+                    break
+                except Exception:
+                    continue
+
+        if not isinstance(items, list):
+            items = []
+
+        validated = []
+        for item in items:
+            if isinstance(item, dict):
+                validated.append({
+                    "name": item.get("name", "Unknown"),
+                    "raw_text": item.get("raw_text", ""),
+                    "price": item.get("price", 0),
+                    "quantity": item.get("quantity", 1),
+                    "unit": item.get("unit", "piece"),
+                })
+
+        return {
+            "success": True,
+            "items": validated,
+            "raw_text": json.dumps(validated, indent=2),
+        }
+
+    def _parse_ocr_json(self, content: str) -> Dict[str, Any]:
+        """Helper method to parse JSON response from LLM"""
+        try:
+            content = content.strip()
+            if content.startswith("```json"):
+                content = content[7:]
+            if content.startswith("```"):
+                content = content[3:]
+            if content.endswith("```"):
+                content = content[:-3]
+            content = content.strip()
+            
+            parsed = json.loads(content)
+            
+            # Handle both formats: raw array OR object with "items" key
+            if isinstance(parsed, list):
+                items = parsed
+            elif isinstance(parsed, dict):
+                items = parsed.get("items", parsed.get("products", []))
+                if not isinstance(items, list):
+                    items = []
+            else:
+                items = []
+            
+            validated_items = []
+            for item in items:
+                if isinstance(item, dict):
+                    validated_items.append(item)
+                    
+            return {
+                "success": True,
+                "raw_text": json.dumps(validated_items, indent=2),
+                "items": validated_items,
+                "confidence": 0.95
+            }
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON response: {e}")
+            import re
+            # Find ALL JSON arrays in the response and pick the longest valid one
+            all_arrays = re.findall(r'\[\s*\{[\s\S]*?\}\s*\]', content)
+            if not all_arrays:
+                # Try simpler pattern for any array
+                all_arrays = re.findall(r'\[[\s\S]*?\]', content)
+            
+            # Try each match, longest first (most likely to be the real data)
+            all_arrays.sort(key=len, reverse=True)
+            for arr_str in all_arrays:
+                try:
+                    parsed = json.loads(arr_str)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        return {
+                            "success": True,
+                            "raw_text": json.dumps(parsed, indent=2),
+                            "items": [i for i in parsed if isinstance(i, dict)],
+                            "confidence": 0.90
+                        }
+                except Exception:
+                    continue
+                    
+            return {
+                "success": False,
+                "raw_text": content,
+                "error": "Failed to parse AI response",
+                "items": []
             }
 
     def _parse_shopping_list_text(self, text: str) -> List[Dict[str, Any]]:

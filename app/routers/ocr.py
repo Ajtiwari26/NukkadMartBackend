@@ -355,6 +355,57 @@ async def upload_and_match(
         }
 
 
+# ==================== Store Inventory OCR (Extract Only) ====================
+
+@router.post("/extract-inventory")
+async def extract_inventory(
+    file: UploadFile = File(...),
+    service: OCRService = Depends(get_ocr_service)
+):
+    """
+    Extract product items from a scanned image for STORE INVENTORY purposes.
+    Uses a dedicated inventory-focused AI prompt that extracts prices and quantities.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # Validate file
+    allowed_types = ["image/jpeg", "image/png", "image/webp"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Allowed: {', '.join(allowed_types)}"
+        )
+
+    contents = await file.read()
+    if len(contents) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File size exceeds 10MB limit")
+
+    # Preprocess image for better OCR
+    processed_image, image_format = await service._preprocess_image(contents, file.content_type)
+
+    # Call the dedicated inventory extraction method directly
+    result = await service.ai.extract_inventory_items(processed_image, image_format)
+    
+    logger.info(f"Inventory extraction result: success={result.get('success')}, items={len(result.get('items', []))}")
+    for item in result.get("items", []):
+        logger.info(f"Extracted: {item}")
+
+    if not result.get("success", False):
+        return {
+            "success": False,
+            "items_count": 0,
+            "items": [],
+            "error": result.get("error", "OCR extraction failed")
+        }
+
+    return {
+        "success": True,
+        "items_count": len(result["items"]),
+        "items": result["items"],
+    }
+
+
 # ==================== Background Task ====================
 
 async def process_ocr_job(service: OCRService, job_id: str):
