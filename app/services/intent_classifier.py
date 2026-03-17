@@ -6,8 +6,11 @@ Uses reasoning model for better Hindi/Hinglish understanding
 import os
 import json
 import logging
+import hashlib
 from typing import Optional, Dict, List
 import boto3
+
+from app.core.llm_cache import get_llm_cache
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,7 @@ class IntentClassifier:
         )
         # Use India-specific model ID
         self.model_id = "apac.amazon.nova-pro-v1:0"
+        self.llm_cache = get_llm_cache()
     
     async def classify_confirmation(
         self,
@@ -319,6 +323,24 @@ Output ONLY this JSON:
 }}"""
 
         try:
+            # === LLM CACHE: Check before calling Bedrock ===
+            product_names = sorted([p.get('name', '') for p in available_products[:20]])
+            context_hash = hashlib.md5('|'.join(product_names).encode()).hexdigest()[:12]
+
+            cached = await self.llm_cache.get(user_speech, "intent", context_hash, available_products=available_products)
+            if cached:
+                logger.info(f"⚡ LLM Cache HIT for intent: '{user_speech[:60]}'")
+                # Re-run product matching against CURRENT inventory (products may have changed)
+                cached_product_name = cached.get('product_name')
+                cached_brand = cached.get('brand')
+                if cached_product_name:
+                    matched_products = self._find_matching_products(
+                        cached_product_name, cached_brand, available_products
+                    )
+                    cached['matched_products'] = matched_products
+                return cached
+            # === End LLM Cache check ===
+
             response = self.bedrock.converse(
                 modelId=self.model_id,
                 messages=[{
@@ -392,7 +414,7 @@ Output ONLY this JSON:
                 action = 'add'
                 logger.info(f"🔄 Auto-promoted QUERY→ADD (quantity specified: {quantity})")
             
-            return {
+            result = {
                 'action': action,
                 'product_name': product_name,
                 'brand': brand,
@@ -400,6 +422,13 @@ Output ONLY this JSON:
                 'is_relative': is_relative,
                 'matched_products': matched_products
             }
+
+            # === LLM CACHE: Store result (without matched_products — they're re-resolved on hit) ===
+            cache_entry = {k: v for k, v in result.items() if k != 'matched_products'}
+            await self.llm_cache.set(user_speech, "intent", cache_entry, context_hash, available_products=available_products)
+            # === End LLM Cache store ===
+
+            return result
             
         except Exception as e:
             logger.error(f"Intent classification error: {e}")

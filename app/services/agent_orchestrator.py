@@ -11,12 +11,14 @@ import os
 import json
 import logging
 import asyncio
+import hashlib
 from typing import Dict, List, Optional
 
 import boto3
 
 from app.models.agent_models import AgentResponse, SuggestedItem
 from app.services.agent_tools import AgentToolExecutor
+from app.core.llm_cache import get_llm_cache
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +196,7 @@ class AgentOrchestrator:
     def __init__(self):
         region = os.getenv("AWS_REGION", "ap-south-1")
         self._bedrock = boto3.client("bedrock-runtime", region_name=region)
+        self.llm_cache = get_llm_cache()
 
     async def process_query(
         self,
@@ -212,6 +215,30 @@ class AgentOrchestrator:
         Returns:
             AgentResponse with message + suggested_items
         """
+        # === LLM CACHE: Check for cached agent response ===
+        # Context hash includes store products for isolation
+        ctx_hash = ""
+        if tool_executor and hasattr(tool_executor, 'current_store_id'):
+            ctx_hash = hashlib.md5((tool_executor.current_store_id or "").encode()).hexdigest()[:12]
+
+        cached = await self.llm_cache.get(user_text, "agent", ctx_hash)
+        if cached:
+            logger.info(f"⚡ LLM Cache HIT for agent query: '{user_text[:60]}'")
+            # Reconstruct AgentResponse from cached dict
+            suggested_items = []
+            for item_data in cached.get("suggested_items", []):
+                try:
+                    suggested_items.append(SuggestedItem(**item_data))
+                except Exception:
+                    pass
+            return AgentResponse(
+                message=cached.get("message", ""),
+                suggested_items=suggested_items,
+                action_required=cached.get("action_required", "info_only"),
+                reasoning=cached.get("reasoning", "cached response"),
+            )
+        # === End LLM Cache check ===
+
         messages = list(conversation_history or [])
         messages.append({
             "role": "user",
@@ -247,7 +274,24 @@ class AgentOrchestrator:
                 # Final response — extract text and parse JSON
                 final_text = self._extract_text(output_message.get("content", []))
                 logger.info(f"✅ Agent final response (turn {turn + 1}): {final_text[:120]}...")
-                return self._parse_response(final_text)
+                agent_response = self._parse_response(final_text)
+
+                # === LLM CACHE: Store agent response ===
+                cache_entry = {
+                    "message": agent_response.message,
+                    "suggested_items": [
+                        {"item_id": si.item_id, "name": si.name, "shop_id": si.shop_id,
+                         "price": si.price, "brand": si.brand, "unit": si.unit,
+                         "store_name": si.store_name, "stock": si.stock, "category": si.category}
+                        for si in (agent_response.suggested_items or [])
+                    ],
+                    "action_required": agent_response.action_required,
+                    "reasoning": agent_response.reasoning,
+                }
+                await self.llm_cache.set(user_text, "agent", cache_entry, ctx_hash, ttl=3600)
+                # === End LLM Cache store ===
+
+                return agent_response
 
             else:
                 logger.warning(f"Unexpected stopReason: {stop_reason} — stopping agent loop")
@@ -491,6 +535,15 @@ async def should_use_agent(user_text: str) -> bool:
     import os
 
     try:
+        # === LLM CACHE: Check cached routing decision ===
+        llm_cache = get_llm_cache()
+        cached_route = await llm_cache.get(user_text, "route")
+        if cached_route is not None:
+            result = cached_route.get("is_agent", False)
+            logger.info(f"⚡ Route Cache HIT for '{user_text[:60]}': {'AGENT' if result else 'FAST'}")
+            return result
+        # === End cache check ===
+
         region = os.getenv("AWS_REGION", "ap-south-1")
         bedrock = boto3.client("bedrock-runtime", region_name=region)
         loop = asyncio.get_event_loop()
@@ -513,6 +566,11 @@ async def should_use_agent(user_text: str) -> bool:
         )
         result = answer.startswith("agent")
         logger.info(f"🗺️  Route decision for '{user_text[:60]}': {'AGENT' if result else 'FAST'} (LLM said: {answer!r})")
+
+        # === LLM CACHE: Store routing decision ===
+        await llm_cache.set(user_text, "route", {"is_agent": result}, ttl=7200)  # 2 hour TTL for routing
+        # === End cache store ===
+
         return result
 
     except Exception as e:

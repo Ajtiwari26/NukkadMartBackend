@@ -71,6 +71,14 @@ class Settings(BaseSettings):
     MAX_DISCOUNT_PERCENT: float = 15.0
     MIN_DISCOUNT_PERCENT: float = 5.0
 
+    # LLM Semantic Cache
+    LLM_CACHE_ENABLED: bool = True
+    LLM_CACHE_EXACT_TTL: int = 3600         # 1 hour for exact match
+    LLM_CACHE_SEMANTIC_TTL: int = 3600      # 1 hour for semantic match
+    LLM_CACHE_SIMILARITY_THRESHOLD: float = 0.55  # Hybrid score threshold (40% cosine + 60% keyword Jaccard)
+    LLM_CACHE_MAX_ENTRIES: int = 200        # Max entries to scan for semantic match per namespace
+    LLM_CACHE_EMBEDDING_DIM: int = 1024     # 1024-dim for semantic accuracy (product search uses 256)
+
     # Razorpay Configuration
     RAZORPAY_KEY_ID: Optional[str] = None
     RAZORPAY_KEY_SECRET: Optional[str] = None

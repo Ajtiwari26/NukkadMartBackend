@@ -11,6 +11,7 @@ import asyncio
 from typing import Optional, List, Dict, Any
 
 from app.config import settings
+from app.core.llm_cache import get_llm_cache
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,7 @@ class AIService:
         self.groq_client = None
         self.groq_api_key = settings.GROQ_API_KEY
         self._groq_key_valid = True  # Set to False after a 401 to skip Groq permanently
+        self.llm_cache = get_llm_cache()
         self._initialize_client()
 
     def _initialize_client(self):
@@ -514,6 +516,20 @@ Example:
             return self._mock_nudge_response(user_behavior)
 
         try:
+            # === LLM CACHE: Exact match for nudge (context = cart + behavior bucket) ===
+            import hashlib
+            cart_ids = sorted([str(item.get('product_id', '')) for item in cart_items])
+            # Bucket abandonment score into 10% ranges for cache grouping
+            score_bucket = int(user_behavior.get('abandonment_score', 0) * 10)
+            nudge_context = f"{','.join(cart_ids)}|{score_bucket}"
+            nudge_ctx_hash = hashlib.md5(nudge_context.encode()).hexdigest()[:12]
+
+            cached = await self.llm_cache.get("nudge_recommendation", "nudge", nudge_ctx_hash)
+            if cached:
+                logger.info(f"⚡ LLM Cache HIT for nudge (score bucket: {score_bucket})")
+                return cached
+            # === End cache check ===
+
             prompt = f"""You are an AI negotiation agent for a local grocery store. Your goal is to prevent cart abandonment while maximizing conversion and clearing slow-moving inventory.
 
 ## Current Situation
@@ -585,14 +601,20 @@ Return ONLY valid JSON, no other text."""
                 content = result.get("choices", [{}])[0].get("message", {}).get("content", "{}")
 
                 try:
-                    return json.loads(content)
+                    nudge_result = json.loads(content)
                 except json.JSONDecodeError:
                     import re
                     json_match = re.search(r'\{[\s\S]*\}', content)
                     if json_match:
-                        return json.loads(json_match.group())
+                        nudge_result = json.loads(json_match.group())
                     else:
                         return self._mock_nudge_response(user_behavior)
+
+                # === LLM CACHE: Store nudge result ===
+                await self.llm_cache.set("nudge_recommendation", "nudge", nudge_result, nudge_ctx_hash, ttl=1800)
+                # === End cache store ===
+
+                return nudge_result
 
         except Exception as e:
             logger.error(f"Groq nudge error: {e}")

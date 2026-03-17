@@ -60,6 +60,42 @@ class EmbeddingService:
         except Exception as e:
             logger.error(f"Embedding generation failed for '{text[:50]}': {e}")
             return None
+
+    def generate_embedding_highres(self, text: str, dimensions: int = 1024) -> Optional[List[float]]:
+        """
+        Generate a high-resolution embedding for semantic caching.
+        Uses 1024 dimensions (vs default 256 for product search) for better
+        semantic accuracy with short Hinglish/Hindi voice queries.
+        """
+        if not text or not text.strip():
+            return None
+
+        try:
+            body = json.dumps({
+                "inputText": text.strip(),
+                "dimensions": dimensions,
+                "normalize": True
+            })
+
+            response = self.bedrock.invoke_model(
+                modelId=self.model_id,
+                contentType="application/json",
+                accept="application/json",
+                body=body
+            )
+
+            result = json.loads(response['body'].read())
+            embedding = result.get('embedding', [])
+
+            if embedding:
+                return embedding
+            else:
+                logger.warning(f"Empty highres embedding for text: '{text[:50]}'")
+                return None
+
+        except Exception as e:
+            logger.error(f"Highres embedding failed for '{text[:50]}': {e}")
+            return None
     
     def generate_batch_embeddings(self, texts: List[str]) -> List[Optional[List[float]]]:
         """
