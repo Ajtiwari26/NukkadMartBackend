@@ -76,7 +76,7 @@ class MongoDB:
         users = cls.database.users
         await users.create_index("user_id", unique=True)
         await users.create_index("phone", unique=True)
-        await users.create_index("email", unique=True, sparse=True)
+        await users.create_index("email", unique=True, sparse=True, name="email_sparse_unique")
 
         logger.info("MongoDB indexes created successfully")
 
